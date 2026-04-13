@@ -1,0 +1,54 @@
+; TestOptCacheDrv.inf
+; INF file for LRU Hash Table test kernel-mode driver
+
+[Version]
+Signature           = "$WINDOWS NT$"
+Class               = System
+ClassGuid           = {4D36E97D-E325-11CE-BFC1-08002BE10318}
+Provider            = %ManufacturerName%
+DriverVer           = 03/11/2026,1.0.0.0
+CatalogFile         = TestOptCacheDrv.cat
+PnpLockdown         = 1
+
+[DestinationDirs]
+TestOptCacheDrv_CopyFiles  = 12 ; %SystemRoot%\System32\drivers
+
+[SourceDisksNames]
+1                   = %DiskName%,,,
+
+[SourceDisksFiles]
+TestOptCacheDrv.sys        = 1
+
+[Manufacturer]
+%ManufacturerName%  = TestOptCacheDrv_Manufacturer, NTx86, NTamd64, NTarm64
+
+[TestOptCacheDrv_Manufacturer.NTx86]
+%TestOptCacheDrv_DeviceDesc% = TestOptCacheDrv_Install, Root\TestOptCacheDrv
+
+[TestOptCacheDrv_Manufacturer.NTamd64]
+%TestOptCacheDrv_DeviceDesc% = TestOptCacheDrv_Install, Root\TestOptCacheDrv
+
+[TestOptCacheDrv_Manufacturer.NTarm64]
+%TestOptCacheDrv_DeviceDesc% = TestOptCacheDrv_Install, Root\TestOptCacheDrv
+
+[TestOptCacheDrv_Install]
+CopyFiles           = TestOptCacheDrv_CopyFiles
+
+[TestOptCacheDrv_Install.Services]
+AddService          = TestOptCacheDrv, 0x00000002, TestOptCacheDrv_Service_Install
+
+[TestOptCacheDrv_CopyFiles]
+TestOptCacheDrv.sys
+
+[TestOptCacheDrv_Service_Install]
+DisplayName         = %TestOptCacheDrv_ServiceName%
+ServiceType         = 1 ; SERVICE_KERNEL_DRIVER
+StartType           = 3 ; SERVICE_DEMAND_START
+ErrorControl        = 1 ; SERVICE_ERROR_NORMAL
+ServiceBinary       = %12%\TestOptCacheDrv.sys
+
+[Strings]
+ManufacturerName            = "AD"
+TestOptCacheDrv_DeviceDesc  = "Optimistic Cache test Driver"
+TestOptCacheDrv_ServiceName = "TestOptCacheDrv"
+DiskName                    = "Optimistic Cache test Driver Installation Disk"

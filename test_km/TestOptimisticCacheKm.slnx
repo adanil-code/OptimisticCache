@@ -1,0 +1,7 @@
+<Solution>
+  <Configurations>
+    <Platform Name="x64" />
+    <Platform Name="x86" />
+  </Configurations>
+  <Project Path="TestOptimisticCacheKm.vcxproj" Id="0e9dc27c-3a41-48bd-acf6-e37a6da08298" />
+</Solution>
