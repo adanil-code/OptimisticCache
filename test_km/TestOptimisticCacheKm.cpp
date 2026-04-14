@@ -114,6 +114,8 @@ typedef char KPROCESSOR_MODE;
 #define KernelMode 0
 #endif
 
+typedef void* PKTHREAD;
+
 // ----------------------------------------------------------------------------
 // Pool Allocation Mocking
 // ----------------------------------------------------------------------------
@@ -263,6 +265,25 @@ inline NTSTATUS KeDelayExecutionThread(_In_ KPROCESSOR_MODE WaitMode,
     }
 
     return 0; // STATUS_SUCCESS
+}
+
+inline PKTHREAD KeGetCurrentThread()
+{
+#if defined(_M_X64)
+    // On x64 Windows, the TEB pointer is stored at offset 0x30 of the GS segment.
+    return reinterpret_cast<PKTHREAD>(__readgsqword(0x30));
+
+#elif defined(_M_IX86)
+    // On 32-bit x86 Windows, the TEB pointer is stored at offset 0x18 of the FS segment.
+    return reinterpret_cast<PKTHREAD>(__readfsdword(0x18));
+
+#elif defined(_M_ARM64)
+    // On ARM64 Windows, the TEB pointer is stored in the x18 register.
+    return reinterpret_cast<PKTHREAD>(__getReg(18));
+
+#else
+#error "Unsupported architecture for MSVC KeGetCurrentThread stub."
+#endif
 }
 
 inline PVOID MmGetSystemRoutineAddress(_In_ PUNICODE_STRING SystemRoutineName)

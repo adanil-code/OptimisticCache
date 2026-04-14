@@ -759,7 +759,10 @@ public:
 
             if (iTargetIdx == -1)
             {
-                iTargetIdx = Hasher(ullKey + ulGlobalulRetries) & 7; // Improved victim selection
+                // Mix the key, the retry count, and the current thread pointer.
+                // KeGetCurrentThread() provides high-entropy, thread-unique data with near-zero overhead.
+                UINT64 ullThreadEntropy = reinterpret_cast<UINT64>(KeGetCurrentThread());
+                iTargetIdx = Hasher(ullKey ^ ullThreadEntropy ^ ulGlobalulRetries) & 7;
             }
 
             UINT64 seq = pHot->Slots[iTargetIdx].Sequence;
