@@ -48,19 +48,6 @@ void* __cdecl operator new(_In_ SIZE_T     uSize,
     return ExAllocatePool2(ullPoolFlags, uSize, ulTag);
 }
 
-void __cdecl operator delete(_In_opt_ void*      pMemory,
-                             _In_     POOL_FLAGS ullPoolFlags,
-                             _In_     ULONG      ulTag)
-{
-    UNREFERENCED_PARAMETER(ullPoolFlags);
-    UNREFERENCED_PARAMETER(ulTag);
-
-    if (pMemory)
-    {
-        ExFreePoolWithTag(pMemory, ulTag);
-    }
-}
-
 void* __cdecl operator new[](_In_ SIZE_T     uSize,
                              _In_ POOL_FLAGS ullPoolFlags,
                              _In_ ULONG      ulTag) noexcept
@@ -68,35 +55,22 @@ void* __cdecl operator new[](_In_ SIZE_T     uSize,
     return ExAllocatePool2(ullPoolFlags, uSize, ulTag);
 }
 
-void __cdecl operator delete[](_In_opt_ void*      pMemory,
-                               _In_     POOL_FLAGS ullPoolFlags,
-                               _In_     ULONG      ulTag)
-{
-    UNREFERENCED_PARAMETER(ullPoolFlags);
-    UNREFERENCED_PARAMETER(ulTag);
-
-    if (pMemory)
-    {
-        ExFreePoolWithTag(pMemory, ulTag);
-    }
-}
-
 void __cdecl operator delete(_In_opt_ void* pMemory)
 {
     if (pMemory)
     {
-        ExFreePoolWithTag(pMemory, 0);
+        ExFreePool(pMemory);
     }
 }
 
-void __cdecl operator delete(_In_opt_ void*  pMemory,
+void __cdecl operator delete(_In_opt_ void* pMemory,
                              _In_     SIZE_T uSize)
 {
     UNREFERENCED_PARAMETER(uSize);
 
     if (pMemory)
     {
-        ExFreePoolWithTag(pMemory, 0);
+        ExFreePool(pMemory);
     }
 }
 
@@ -104,18 +78,18 @@ void __cdecl operator delete[](_In_opt_ void* pMemory)
 {
     if (pMemory)
     {
-        ExFreePoolWithTag(pMemory, 0);
+        ExFreePool(pMemory);
     }
 }
 
-void __cdecl operator delete[](_In_opt_ void*  pMemory,
+void __cdecl operator delete[](_In_opt_ void* pMemory,
                                _In_     SIZE_T uSize)
 {
     UNREFERENCED_PARAMETER(uSize);
 
     if (pMemory)
     {
-        ExFreePoolWithTag(pMemory, 0);
+        ExFreePool(pMemory);
     }
 }
 
@@ -169,7 +143,7 @@ public:
 };
 
 template<typename T, typename Compare>
-void QuickSort(_Inout_updates_(uCount) T*      pBase,
+void QuickSort(_Inout_updates_(uCount) T* pBase,
                _In_                    SIZE_T  uCount,
                _In_                    Compare Comp)
 {
@@ -315,7 +289,7 @@ void QuickSort(_Inout_updates_(uCount) T*      pBase,
 // ----------------------------------------------------------------------------
 // Thread Management Utilities
 // ----------------------------------------------------------------------------
-#define MAX_TEST_THREADS 256 
+#define MAX_TEST_THREADS 2048 
 
 struct TEST_WORKER_CONTEXT
 {
@@ -487,6 +461,26 @@ VOID StopAndWaitThreads(_Inout_ TEST_THREAD_MANAGER* pMgr,
         {
             ObDereferenceObject(pMgr->pThreads[ulIndex]);
         }
+    }
+}
+
+VOID SetWorkerThreadAffinity(_In_ ULONG ulThreadId)
+{
+    ULONG ulTotalProcessors = KeQueryActiveProcessorCountEx(ALL_PROCESSOR_GROUPS);
+    if (ulTotalProcessors == 0)
+    {
+        ulTotalProcessors = 1;
+    }
+
+    PROCESSOR_NUMBER procNum;
+    if (NT_SUCCESS(KeGetProcessorNumberFromIndex(ulThreadId % ulTotalProcessors, &procNum)))
+    {
+        GROUP_AFFINITY affinity = { 0 };
+        affinity.Group = procNum.Group;
+        affinity.Mask  = (KAFFINITY)-1; // Allow execution on any core within this group
+        
+        // Correctly set the group affinity for the CURRENT thread
+        KeSetSystemGroupAffinityThread(&affinity, NULL);
     }
 }
 
@@ -757,6 +751,8 @@ VOID AbaWorker(_Inout_ TEST_WORKER_CONTEXT* pCtx)
 {
     PAGED_CODE();
 
+    SetWorkerThreadAffinity(pCtx->ulThreadId);
+
     using ContextType = typename CacheContextTraits<TContextSize>::Type;
 
     WorkerCtx<TContextSize>* pAbaCtx = (WorkerCtx<TContextSize>*)pCtx->pUserContext;
@@ -911,6 +907,8 @@ template <SIZE_T TContextSize>
 VOID MixedOpsWorker(_Inout_ TEST_WORKER_CONTEXT* pCtx)
 {
     PAGED_CODE();
+
+    SetWorkerThreadAffinity(pCtx->ulThreadId);
 
     using ContextType = typename CacheContextTraits<TContextSize>::Type;
 
@@ -1093,6 +1091,8 @@ VOID ConstantEvictionWorker(_Inout_ TEST_WORKER_CONTEXT* pCtx)
 {
     PAGED_CODE();
 
+    SetWorkerThreadAffinity(pCtx->ulThreadId);
+
     using ContextType = typename CacheContextTraits<TContextSize>::Type;
 
     WorkerCtx<TContextSize>* pWorkerCtx = (WorkerCtx<TContextSize>*)pCtx->pUserContext;
@@ -1222,6 +1222,8 @@ template <SIZE_T TContextSize>
 VOID ScalingWorker(_Inout_ TEST_WORKER_CONTEXT* pCtx)
 {
     PAGED_CODE();
+
+    SetWorkerThreadAffinity(pCtx->ulThreadId);
 
     using ContextType = typename CacheContextTraits<TContextSize>::Type;
 
@@ -1402,6 +1404,8 @@ template <SIZE_T TContextSize>
 VOID TailLatencyWorker(_Inout_ TEST_WORKER_CONTEXT* pCtx)
 {
     PAGED_CODE();
+
+    SetWorkerThreadAffinity(pCtx->ulThreadId);
 
     using ContextType = typename CacheContextTraits<TContextSize>::Type;
 
@@ -1770,13 +1774,33 @@ extern "C" NTSTATUS DriverEntry(_In_ PDRIVER_OBJECT  pDriverObject,
 
     if (NT_SUCCESS(ntStatus))
     {
-        ObReferenceObjectByHandle(hThread,
-                                  THREAD_ALL_ACCESS,
-                                  NULL,
-                                  KernelMode,
-                                  (PVOID*)&g_pMasterBenchmarkThread,
-                                  NULL);
+        NTSTATUS refStatus = ObReferenceObjectByHandle(hThread,
+                                                       THREAD_ALL_ACCESS,
+                                                       NULL,
+                                                       KernelMode,
+                                                       (PVOID*)&g_pMasterBenchmarkThread,
+                                                       NULL);
+
+        if (!NT_SUCCESS(refStatus))
+        {
+            LOG_ERR("[OPT_CACHE] [!] Failed to reference master thread handle. Aborting.\n");
+            
+            // Fast abort the thread we just spawned
+            InterlockedExchange(&g_lAbortTests, 1);
+            
+            // Wait for it to safely terminate to prevent the BSOD condition
+            ZwWaitForSingleObject(hThread, FALSE, NULL);
+            ZwClose(hThread);
+            
+            return refStatus;
+        }
+
         ZwClose(hThread);
+    }
+    else
+    {
+        LOG_ERR("[OPT_CACHE] [!] Failed to create master system thread.\n");
+        return ntStatus;
     }
 
     return STATUS_SUCCESS;
