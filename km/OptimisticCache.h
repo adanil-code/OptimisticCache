@@ -232,6 +232,7 @@ private:
         CacheSetCold* pSetsCold;       // Pointer to the contiguous block of Cold payload sets
         SIZE_T        uMask;           // Bitwise mask used to rapidly route hashes to specific buckets
         SIZE_T        uAllocationSize; // Track exactly how much memory was allocated
+        ULONG         uVictimEntropy;  // 4-byte counter for zero-cost entropy
     };
 
     Shard* m_pShards;                  // Aligned array of cache shards used to distribute workload and minimize lock contention
@@ -478,6 +479,19 @@ public:
             m_pShards[i].pSetsCold       = nullptr;
             m_pShards[i].uMask           = uSets - 1;
             m_pShards[i].uAllocationSize = cbHot + cbCold + 63;
+            
+        #if defined(_M_AMD64) || defined(_M_IX86)
+            ULONG ulEntropySeed = static_cast<ULONG>(__rdtsc());
+        #elif defined(_M_ARM64)
+            ULONG ulEntropySeed = static_cast<ULONG>(_ReadStatusReg(ARM64_CNTVCT_EL0));
+        #else
+            // Fallback for unsupported architectures to ensure it still compiles
+            LARGE_INTEGER tickCount;
+            KeQueryTickCount(&tickCount);
+            ULONG ulEntropySeed = tickCount.LowPart;
+        #endif
+
+            m_pShards[i].uVictimEntropy = ulEntropySeed ^ i;
 
             RtlZeroMemory(m_pShards[i].pSetsHot, cbHot);
 
@@ -759,10 +773,8 @@ public:
 
             if (iTargetIdx == -1)
             {
-                // Mix the key, the retry count, and the current thread pointer.
-                // KeGetCurrentThread() provides high-entropy, thread-unique data with near-zero overhead.
-                UINT64 ullThreadEntropy = reinterpret_cast<UINT64>(KeGetCurrentThread());
-                iTargetIdx = Hasher(ullKey ^ ullThreadEntropy ^ ulGlobalulRetries) & 7;
+                // Mix the key, the retry count, and the per-shard victim entropy.                
+                iTargetIdx = Hasher(ullKey ^ (pShard->uVictimEntropy++) ^ ulGlobalulRetries) & 7;                
             }
 
             UINT64 seq = pHot->Slots[iTargetIdx].Sequence;
