@@ -71,6 +71,23 @@
 #endif
 
 // ----------------------------------------------------------------------------
+// Cache Line Constants
+//
+// We explicitly avoid std::hardware_destructive_interference_size due to ABI 
+// instability warnings ([-Winterference-size]) across different compiler flags.
+// 
+// Apply 128-byte alignment strictly for Apple Silicon to prevent false sharing,
+// while preserving optimal 64-byte density for x86_64 and standard Linux ARM64.
+// ----------------------------------------------------------------------------
+#if defined(__APPLE__) && defined(__aarch64__)
+    constexpr size_t CACHE_LINE_SIZE = 128;
+#else        
+    constexpr size_t CACHE_LINE_SIZE = 64;
+#endif
+
+constexpr size_t CACHE_LINE_MASK = CACHE_LINE_SIZE - 1;
+
+// ----------------------------------------------------------------------------
 // YieldProcessorThread
 // Issues a hardware-level hint to the CPU pipeline that the current thread
 // is in a spin-loop. This prevents the pipeline from speculatively executing
@@ -117,56 +134,56 @@ struct DefaultNumaAllocator
     static const std::vector<uint32_t>& GetValidNodes() noexcept
     {
         static const std::vector<uint32_t> validNodes = []()
+        {
+            try
             {
-                try
-                {
-                    std::vector<uint32_t> nodes;
+                std::vector<uint32_t> nodes;
 
 #if defined(_WIN32)
-                    ULONG highestNode = 0;
+                ULONG highestNode = 0;
 
-                    if (GetNumaHighestNodeNumber(&highestNode)) [[likely]]
-                    {
-                        const USHORT maxNode = static_cast<USHORT>(highestNode);
-
-                        for (USHORT i = 0; i <= maxNode; ++i)
-                        {
-                            ULONGLONG availableMemory = 0;
-                            if (GetNumaAvailableMemoryNodeEx(i, &availableMemory))
-                            {
-                                nodes.push_back(i);
-                            }
-                        }
-                    }
-#elif defined(__linux__)
-                    if (numa_available() >= 0) [[likely]]
-                    {
-                        int highestNode = numa_max_node();
-
-                        for (int i = 0; i <= highestNode; ++i)
-                        {
-                            if (numa_bitmask_isbitset(numa_all_nodes_ptr, i))
-                            {
-                                nodes.push_back(i);
-                            }
-                        }
-                    }
-#endif
-                    if (nodes.empty()) [[unlikely]]
-                    {
-                        nodes.push_back(0);
-                    }
-
-                    nodes.shrink_to_fit();
-                    return nodes;
-                }
-                catch (...)
+                if (GetNumaHighestNodeNumber(&highestNode)) [[likely]]
                 {
-                    // Returns a static fallback to strictly prevent dangling reference UB
-                    static const std::vector<uint32_t> fallback{ 0 };
-                    return fallback;
+                    const USHORT maxNode = static_cast<USHORT>(highestNode);
+
+                    for (USHORT i = 0; i <= maxNode; ++i)
+                    {
+                        ULONGLONG availableMemory = 0;
+                        if (GetNumaAvailableMemoryNodeEx(i, &availableMemory))
+                        {
+                            nodes.push_back(i);
+                        }
+                    }
                 }
-            }();
+#elif defined(__linux__)
+                if (numa_available() >= 0) [[likely]]
+                {
+                    int highestNode = numa_max_node();
+
+                    for (int i = 0; i <= highestNode; ++i)
+                    {
+                        if (numa_bitmask_isbitset(numa_all_nodes_ptr, i))
+                        {
+                            nodes.push_back(i);
+                        }
+                    }
+                }
+#endif
+                if (nodes.empty()) [[unlikely]]
+                {
+                    nodes.push_back(0);
+                }
+
+                nodes.shrink_to_fit();
+                return nodes;
+            }
+            catch (...)
+            {
+                // Returns a static fallback to strictly prevent dangling reference UB
+                static const std::vector<uint32_t> fallback{ 0 };
+                return fallback;
+            }
+        }();
 
         return validNodes;
     }
@@ -203,13 +220,13 @@ struct DefaultNumaAllocator
             return ptr;
         }
 
-        return ::operator new[](size, std::align_val_t{ 64 }, std::nothrow);
+        return ::operator new[](size, std::align_val_t{ CACHE_LINE_SIZE }, std::nothrow);
 #else
-        return ::operator new[](size, std::align_val_t{ 64 }, std::nothrow);
+        return ::operator new[](size, std::align_val_t{ CACHE_LINE_SIZE }, std::nothrow);
 #endif
     }
 
-    static inline void Free(void*  ptr,
+    static inline void Free(void* ptr,
                             size_t size) noexcept
     {
         if (!ptr) [[unlikely]]
@@ -226,10 +243,10 @@ struct DefaultNumaAllocator
         }
         else
         {
-            ::operator delete[](ptr, std::align_val_t{ 64 });
+            ::operator delete[](ptr, std::align_val_t{ CACHE_LINE_SIZE });
         }
 #else
-        ::operator delete[](ptr, std::align_val_t{ 64 });
+        ::operator delete[](ptr, std::align_val_t{ CACHE_LINE_SIZE });
 #endif
     }
 };
@@ -343,7 +360,7 @@ struct CacheContextTraits<128>
 //   odd number, perform the write, and release by incrementing to an even number.
 // 
 // - Hot/Cold Segregation: Cache memory is split. Metadata (Keys and Sequences) 
-//   are packed into "Hot" 64-byte blocks to maximize L1 search density. Payload 
+//   are packed into "Hot" blocks to maximize L1 search density. Payload 
 //   data is isolated in "Cold" blocks. This prevents large payloads from 
 //   polluting the CPU cache during hash collisions or cache misses.
 // 
@@ -368,14 +385,16 @@ public:
 
     using EnumerateCallback = void (*)(uint64_t    key,
                                        ContextType context,
-                                       void*       userData);
+                                       void* userData);
 
     // ------------------------------------------------------------------------
     // CacheSetHot (L1 Cache Optimized)
     // Hot search metadata. Packed sequentially to maximize L1 search density.
     // Contains only the minimum data needed to verify a match and sequence state.
+    // Forced to 128-byte alignment to prevent 3-cache-line straddling on 64-byte 
+    // architectures while sitting perfectly on a single 128-byte Apple Silicon line.
     // ------------------------------------------------------------------------
-    struct alignas(64) CacheSetHot
+    struct alignas(128) CacheSetHot
     {
         std::array<std::atomic<uint64_t>, 8> Keys;
         std::array<std::atomic<uint64_t>, 8> Seqs;
@@ -386,7 +405,7 @@ public:
     // Cold payload data. Segregated to prevent cache pollution. Accessed only 
     // when a definitive key match occurs in the corresponding Hot set.
     // ------------------------------------------------------------------------
-    struct alignas(64) CacheSetCold
+    struct alignas(CACHE_LINE_SIZE) CacheSetCold
     {
         std::array<ContextType, 8> Contexts;
     };
@@ -397,21 +416,21 @@ public:
 
     // ------------------------------------------------------------------------
     // Cache Shard
-    // Aligned to 64 bytes to prevent false sharing across CPU cache lines.
+    // Aligned to dynamic hardware cache line size to prevent false sharing.
     // Independently manages its assigned portion of the hot/cold sets.
     // ------------------------------------------------------------------------
-    struct alignas(64) Shard
+    struct alignas(CACHE_LINE_SIZE) Shard
     {
-        void*         RawMemoryBlock;  // Base pointer for accurate allocator deallocation
+        void* RawMemoryBlock;  // Base pointer for accurate allocator deallocation
         size_t        AllocationSize;  // Exact size allocated on the NUMA node
-        CacheSetHot*  HotSets;         // Pointer to the contiguous block of Hot metadata sets
+        CacheSetHot* HotSets;         // Pointer to the contiguous block of Hot metadata sets
         CacheSetCold* ColdSets;        // Pointer to the contiguous block of Cold payload sets
         size_t        Mask;            // Bitwise mask used to rapidly route hashes to specific buckets
     };
 
 private:
-    Shard*   m_shards;                 // Aligned array of cache shards used to distribute workload and minimize lock contention
-    void*    m_shardsBase;             // Raw pointer for proper NUMA allocator deallocation
+    Shard* m_shards;                 // Aligned array of cache shards used to distribute workload and minimize lock contention
+    void* m_shardsBase;             // Raw pointer for proper NUMA allocator deallocation
     size_t   m_shardsBaseSize;         // Total byte size of the raw memory allocation required to safely free the block
     uint32_t m_shardCount;             // Total number of shards, guaranteed to be a power of two for fast bitwise hash routing
 
@@ -543,7 +562,7 @@ public:
 
         try
         {
-            m_shardsBaseSize = (sizeof(Shard) * m_shardCount) + 63;
+            m_shardsBaseSize = (sizeof(Shard) * m_shardCount) + CACHE_LINE_MASK;
             m_shardsBase     = TAllocator::Allocate(m_shardsBaseSize, primaryNode);
 
             if (!m_shardsBase) [[unlikely]]
@@ -552,7 +571,7 @@ public:
             }
 
             uintptr_t shardPtr = reinterpret_cast<uintptr_t>(m_shardsBase);
-            shardPtr = (shardPtr + 63) & ~(uintptr_t)63;
+            shardPtr = (shardPtr + CACHE_LINE_MASK) & ~(uintptr_t)CACHE_LINE_MASK;
             m_shards = reinterpret_cast<Shard*>(shardPtr);
 
             // Zero-initialize the shards array. This is critical for preventing 
@@ -585,7 +604,7 @@ public:
                 coldSize = numSets * sizeof(CacheSetCold);
             }
 
-            size_t allocationSizePerShard = hotSize + coldSize + 63;
+            size_t allocationSizePerShard = hotSize + coldSize + CACHE_LINE_MASK;
 
             for (uint32_t i = 0; i < m_shardCount; ++i)
             {
@@ -603,7 +622,7 @@ public:
                 m_shards[i].AllocationSize = allocationSizePerShard;
 
                 uintptr_t uPtr = reinterpret_cast<uintptr_t>(rawBlock);
-                uPtr = (uPtr + 63) & ~(uintptr_t)63;
+                uPtr = (uPtr + CACHE_LINE_MASK) & ~(uintptr_t)CACHE_LINE_MASK;
 
                 m_shards[i].HotSets  = reinterpret_cast<CacheSetHot*>(uPtr);
                 m_shards[i].ColdSets = nullptr;
@@ -731,7 +750,7 @@ public:
                                 ContextType  context,
                                 InsertPolicy policy,
                                 ContextType* outExistingContext = nullptr,
-                                uint64_t*    outEvictedKey      = nullptr,
+                                uint64_t* outEvictedKey      = nullptr,
                                 ContextType* outEvictedContext  = nullptr)
     {
         // Explicitly report an error state to the caller for invalid states
@@ -742,10 +761,10 @@ public:
 
         uint64_t hash = Hasher(key);
         uint32_t shardIndex = static_cast<uint32_t>((hash >> 48) ^ (hash >> 56)) & (m_shardCount - 1);
-        Shard*   shard      = &m_shards[shardIndex];
+        Shard* shard      = &m_shards[shardIndex];
 
         size_t setIndex = (hash ^ (hash >> 32)) & shard->Mask;
-        CacheSetHot*  hotSet  = &shard->HotSets[setIndex];
+        CacheSetHot* hotSet  = &shard->HotSets[setIndex];
         CacheSetCold* coldSet = shard->ColdSets;
 
         uint32_t globalRetries = 0;
@@ -927,10 +946,10 @@ public:
 
         uint64_t hash = Hasher(key);
         uint32_t shardIndex = static_cast<uint32_t>((hash >> 48) ^ (hash >> 56)) & (m_shardCount - 1);
-        Shard*   shard      = &m_shards[shardIndex];
+        Shard* shard      = &m_shards[shardIndex];
 
         size_t setIndex = (hash ^ (hash >> 32)) & shard->Mask;
-        CacheSetHot*  hotSet  = &shard->HotSets[setIndex];
+        CacheSetHot* hotSet  = &shard->HotSets[setIndex];
         CacheSetCold* coldSet = shard->ColdSets;
 
         int hitIndex = FindHitIndex(hotSet, key);
@@ -1002,7 +1021,7 @@ public:
 
         uint64_t hash = Hasher(key);
         uint32_t shardIndex = static_cast<uint32_t>((hash >> 48) ^ (hash >> 56)) & (m_shardCount - 1);
-        Shard*   shard      = &m_shards[shardIndex];
+        Shard* shard      = &m_shards[shardIndex];
 
         size_t setIndex = (hash ^ (hash >> 32)) & shard->Mask;
         CacheSetHot* hotSet = &shard->HotSets[setIndex];
@@ -1065,10 +1084,10 @@ public:
 
         uint64_t hash = Hasher(key);
         uint32_t shardIndex = static_cast<uint32_t>((hash >> 48) ^ (hash >> 56)) & (m_shardCount - 1);
-        Shard*   shard      = &m_shards[shardIndex];
+        Shard* shard      = &m_shards[shardIndex];
 
         size_t setIndex = (hash ^ (hash >> 32)) & shard->Mask;
-        CacheSetHot*  hotSet  = &shard->HotSets[setIndex];
+        CacheSetHot* hotSet  = &shard->HotSets[setIndex];
         CacheSetCold* coldSet = shard->ColdSets;
 
         int hitIndex = FindHitIndex(hotSet, key);
@@ -1143,7 +1162,7 @@ public:
     //              the static callback scope.
     // ------------------------------------------------------------------------
     void Enumerate(EnumerateCallback callback,
-                   void*             userData)
+                   void* userData)
     {
         if (!m_shards || !callback) [[unlikely]]
         {
@@ -1156,7 +1175,7 @@ public:
 
             for (size_t setIdx = 0; setIdx < numSets; ++setIdx)
             {
-                CacheSetHot*  hotSet  = &m_shards[i].HotSets[setIdx];
+                CacheSetHot* hotSet  = &m_shards[i].HotSets[setIdx];
                 CacheSetCold* coldSet = m_shards[i].ColdSets;
 
                 for (int slot = 0; slot < 8; ++slot)
