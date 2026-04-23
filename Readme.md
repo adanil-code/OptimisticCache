@@ -85,7 +85,7 @@ The cache utilizes a "Mega-Block" flat-array design. Each shard allocates a sing
 ### Hot / Cold Memory Segregation
 As illustrated in the geometry above, metadata and payloads are physically separated to maximize cache efficiency.
 
-**Why it matters:** The search metadata for 8 slots is packed into exactly 128 bytes (two contiguous 64-byte cache lines). Hardware spatial prefetchers typically load these adjacent lines together, allowing the CPU to scan an entire collision set with extreme efficiency. Failed lookups never touch payload memory, strictly preventing L1 cache pollution.
+**Why it matters:** The search metadata for 8 slots is packed into exactly 128 bytes (two contiguous 64-byte cache lines on x86_64 and ARM64, or a single 128-byte cache line on Apple silicon). Hardware spatial prefetchers typically load these adjacent lines together, allowing the CPU to scan an entire collision set with extreme efficiency. Failed lookups never touch payload memory, strictly preventing L1 cache pollution.
 
 ### Sharded Partitioning
 The cache is split into power-of-two shards, scaling automatically with the logical processor count. Each shard operates independently, eliminating global lock contention and reducing cross-core interference.
@@ -139,7 +139,7 @@ Because the cache does not dynamically resize and utilizes flat pre-allocated ar
 **Memory Overhead Calculation:**
 * **Metadata Overhead:** Exactly 16 bytes per slot (128 bytes per 8-slot set).
 * **Payload Overhead:** Dependent on the template configuration (`0`, `8`, or `16` bytes per slot).
-* Every shard has a fixed 64-byte padding overhead to prevent false sharing.
+* Every shard has a fixed hardware-specific padding overhead (64 bytes on x86_64 and ARM64, and 128 bytes on Apple silicon) to prevent false sharing.
 
 ---
 
@@ -210,7 +210,7 @@ While designed for high-concurrency environments, this architecture possesses sp
 
 * **128-bit Payload Tearing Retries:** `OptimisticCache<128>` uses two separate 64-bit relaxed atomic loads. While the overarching SeqLock prevents corrupted data from "torn reads", a high volume of concurrent writes to a 128-bit slot will force readers to loop and retry more frequently than in the 64-bit configuration.
 
-* **No Backpressure or Fairness Mechanism**  The architecture intentionally avoids locks, queues, and coordination structures. As a result:
+* **No Backpressure or Fairness Mechanism** The architecture intentionally avoids locks, queues, and coordination structures. As a result:
     * There is no fairness between threads
     * No prioritization of older operations
     * No mechanism to throttle or shed load under pressure
@@ -225,11 +225,11 @@ Both implementations share identical geometry and architecture, but adapt to the
 
 | Feature                          | User Mode (`optimistic_cache.h`)      | Kernel Mode (`OptimisticCache.h`)           |
 | :------------------------------- | :------------------------------------ | :------------------------------------------ |
-| **Primitives**                   | C++20 `<atomic>`                      | Explicit hardware memory barriers           |
-| **Backoff**                      | Scheduler-based yielding              | IRQL-aware scheduling yields                |
-| **Memory**                       | Pageable virtual memory               | Non-paged pool memory                       |
-| **Write Integrity**              | Standard thread preemption            | `DISPATCH_LEVEL` write guarantees           |
-| **Eviction / Victim Selection**  | Probabilistic (`FastThreadLocalPRNG`) | Deterministic (`Hasher(Key + Retries) & 7`) |
+| **Primitives** | C++20 `<atomic>`                      | Explicit hardware memory barriers           |
+| **Backoff** | Scheduler-based yielding              | IRQL-aware scheduling yields                |
+| **Memory** | Pageable virtual memory               | Non-paged pool memory                       |
+| **Write Integrity** | Standard thread preemption            | `DISPATCH_LEVEL` write guarantees           |
+| **Eviction / Victim Selection** | Probabilistic (`FastThreadLocalPRNG`) | Deterministic (`Hasher(Key + Retries) & 7`) |
 
 **Eviction Logic Note:** Generating PRNG state without floating-point registers in kernel mode is complex. To rotate victims securely under pressure without relying on thread-local state, the KM table relies on a deterministic fallback hash retry, whereas the UM table utilizes a rapid thread-local PRNG to probabilistically select victims and mitigate collision storms.
 
@@ -255,8 +255,8 @@ Under an 80/20 Read-Heavy workload, the Optimistic Cache scales efficiently with
 
 | Implementation       | i7-1165G7 (Mobile, 8-Thread) | i7-8086K (Desktop, 12-Thread) | i7-12700H (Hybrid, 20-Thread) |
 | :------------------- | :--------------------------- | :---------------------------- | :---------------------------- |
-| **Std: Map+Mutex**   | 0.32x (Negative Scaling)     | 0.44x (Negative Scaling)      | 0.28x (Negative Scaling)      |
-| **Lock-Free Cache**  | **3.04x** (at 8 threads)     | **6.94x** (at 12 threads)     | **8.79x** (at 20 threads)     |
+| **Std: Map+Mutex** | 0.32x (Negative Scaling)     | 0.44x (Negative Scaling)      | 0.28x (Negative Scaling)      |
+| **Lock-Free Cache** | **3.04x** (at 8 threads)     | **6.94x** (at 12 threads)     | **8.79x** (at 20 threads)     |
 
 ### Predictable Tail Latency (P99.9, P99.99)
 At extreme percentiles, the true cost of OS-mediated locks becomes apparent. At the 99.9th percentile (approaches the algorithmic minimum latency of the lookup path), the wait-free SeqLock protocol maintains nanosecond-level latency, avoiding the severe context-switch penalties of standard locking mechanisms. 
@@ -264,27 +264,27 @@ At extreme percentiles, the true cost of OS-mediated locks becomes apparent. At 
 **Metric: P99.9 Latency**
 | Hardware Topology       | Std: Map+Mutex | Lock-Free Cache | Stability Advantage    |
 | :---------------------- | :------------- | :-------------- | :--------------------- |
-| **i7-1165G7 (Mobile)**  | 207,514 ns     | **179 ns**      | **1,159x More Stable** |
-| **i7-8086K (Desktop)**  | 236,869 ns     | **107 ns**      | **2,213x More Stable** |
-| **i7-12700H (Hybrid)** |  591,390 ns     | **231 ns**      | **2,560x More Stable** |
+| **i7-1165G7 (Mobile)** | 207,514 ns     | **179 ns** | **1,159x More Stable** |
+| **i7-8086K (Desktop)** | 236,869 ns     | **107 ns** | **2,213x More Stable** |
+| **i7-12700H (Hybrid)** |  591,390 ns     | **231 ns** | **2,560x More Stable** |
 
 **Metric: P99.99 Latency (OS Wait Starvation)**
 At the 99.99th percentile, standard locks frequently stall for over a millisecond as threads are descheduled. The Optimistic Cache's tiered hardware backoff and wait-free reads significantly reduces tail latency variance.
 
 | Hardware Topology       | Std: Map+Mutex | Lock-Free Cache | Stability Advantage    |
 | :---------------------- | :------------- | :-------------- | :--------------------- |
-| **i7-1165G7 (Mobile)**  | 656,625 ns     | **3,278 ns**    | **200x More Stable**   |
-| **i7-8086K (Desktop)**  | 553,988 ns     | **246 ns**      | **2,251x More Stable** |
-| **i7-12700H (Hybrid)**  | 1,476,190 ns   | **301 ns**      | **4,904x More Stable** |
+| **i7-1165G7 (Mobile)** | 656,625 ns     | **3,278 ns** | **200x More Stable** |
+| **i7-8086K (Desktop)** | 553,988 ns     | **246 ns** | **2,251x More Stable** |
+| **i7-12700H (Hybrid)** | 1,476,190 ns   | **301 ns** | **4,904x More Stable** |
 
 ### Total Throughput Speedup (Mixed Contention)
 Under heavy 50/50 mixed workloads (simultaneous reads, inserts, and aggressive evictions), the architectural differences create a significant performance gap. As core counts scale up, the standard table collapses under its own synchronization weight, while the Optimistic Cache leverages its sharded layout and wait-free reads to achieve high throughput.
 
 | System Profile                  | Lock-Free Ops/Sec | Std Ops/Sec       | Total Speedup     |
 | :------------------------------ | :---------------- | :---------------- | :---------------- |
-| **Mobile (4-Core/8-Thread)**    | 89.2 Million      | 6.4 Million       | **~13.7x Faster** |
-| **Desktop (6-Core/12-Thread)**  | 207.0 Million     | 8.0 Million       | **~25.7x Faster** |
-| **Hybrid (14-Core/20-Thread)**  | 253.9 Million     | 5.9 Million       | **~42.6x Faster** |
+| **Mobile (4-Core/8-Thread)** | 89.2 Million      | 6.4 Million       | **~13.7x Faster** |
+| **Desktop (6-Core/12-Thread)** | 207.0 Million     | 8.0 Million       | **~25.7x Faster** |
+| **Hybrid (14-Core/20-Thread)** | 253.9 Million     | 5.9 Million       | **~42.6x Faster** |
 
 ### Reproducing Benchmarks
 All benchmarks were conducted on Windows 10/11 using the `test_um` harness included in this repository, compiled with Microsoft Visual Studio 2026. The corresponding MSVC project files are provided for full reproducibility.
