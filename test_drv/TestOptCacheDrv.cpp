@@ -20,7 +20,8 @@
 // 
 // TEST RESULTS OUTPUT:
 // DbgPrintEx(DPFLTR_IHVDRIVER_ID, ...) is used for all logging and output, 
-// allowing real-time monitoring
+// allowing real-time monitoring. Performance test results are also saved in a 
+// text file (\SystemRoot\Temp\OptCachePerf.txt) when the test suite completes.
 // ----------------------------------------------------------------------------
 
 #define TEST_IS_KM 1
@@ -94,10 +95,107 @@ void __cdecl operator delete[](_In_opt_ void* pMemory,
 }
 
 // ----------------------------------------------------------------------------
+// Logging Infrastructure
+// ----------------------------------------------------------------------------
+#define MAX_LOG_LINE 512
+
+PCHAR      g_pLogBuffer        = NULL;
+size_t     g_cbLogBufferMax    = 1024 * 1024 * 2; // 2 MB Allocation
+size_t     g_cbLogBufferOffset = 0;
+FAST_MUTEX g_LogMutex;
+
+// UPDATED: Added ulLevel parameter
+VOID RecordLog(_In_ ULONG ulLevel, 
+               _In_ _Printf_format_string_ PCSTR pszFormat, 
+               ...)
+{
+    va_list args;
+    va_start(args, pszFormat);
+
+    char szLine[MAX_LOG_LINE];
+    NTSTATUS status = RtlStringCbVPrintfA(szLine, sizeof(szLine), pszFormat, args);
+    if (NT_SUCCESS(status))
+    {
+        // Echo to debugger with the correct severity level
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, ulLevel, "%s", szLine);
+
+        // Write to memory buffer
+        ExAcquireFastMutex(&g_LogMutex);
+        
+        if (g_pLogBuffer)
+        {
+            size_t cbLen = 0;
+            RtlStringCbLengthA(szLine, MAX_LOG_LINE, &cbLen);
+            
+            if (g_cbLogBufferOffset + cbLen < g_cbLogBufferMax)
+            {
+                RtlCopyMemory(g_pLogBuffer + g_cbLogBufferOffset, szLine, cbLen);
+                g_cbLogBufferOffset += cbLen;
+                g_pLogBuffer[g_cbLogBufferOffset] = '\0';
+            }
+        }
+        
+        ExReleaseFastMutex(&g_LogMutex);
+    }
+
+    va_end(args);
+}
+
+VOID FlushLogToFile()
+{
+    PAGED_CODE();
+
+    if (!g_pLogBuffer || g_cbLogBufferOffset == 0)
+    {
+        return;
+    }
+
+    UNICODE_STRING    uniName;
+    OBJECT_ATTRIBUTES objAttr;
+    
+    RtlInitUnicodeString(&uniName, L"\\SystemRoot\\Temp\\OptCachePerf.txt");
+    InitializeObjectAttributes(&objAttr, &uniName, OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE, NULL, NULL);
+
+    HANDLE          hFile;
+    IO_STATUS_BLOCK ioStatusBlock;
+    
+    NTSTATUS ntStatus = ZwCreateFile(&hFile,
+                                     FILE_APPEND_DATA,
+                                     &objAttr,
+                                     &ioStatusBlock,
+                                     NULL,
+                                     FILE_ATTRIBUTE_NORMAL,
+                                     0,
+                                     FILE_OPEN_IF,
+                                     FILE_SYNCHRONOUS_IO_NONALERT,
+                                     NULL,
+                                     0);
+
+    if (NT_SUCCESS(ntStatus))
+    {
+        ZwWriteFile(hFile, 
+                    NULL, 
+                    NULL, 
+                    NULL, 
+                    &ioStatusBlock, 
+                    g_pLogBuffer, 
+                    (ULONG)g_cbLogBufferOffset, 
+                    NULL, 
+                    NULL);
+                    
+        ZwClose(hFile);
+    }
+    else
+    {
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, "[OPT_CACHE] [!] Failed to create log file: 0x%08X\n", ntStatus);
+    }
+}
+
+// ----------------------------------------------------------------------------
 // Test Logging & Validation Macros
 // ----------------------------------------------------------------------------
-#define LOG_INFO(...) DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL, __VA_ARGS__)
-#define LOG_ERR(...)  DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, __VA_ARGS__)
+#define LOG_INFO(...) RecordLog(DPFLTR_INFO_LEVEL, __VA_ARGS__)
+#define LOG_ERR(...)  RecordLog(DPFLTR_ERROR_LEVEL, __VA_ARGS__)
 
 #define TEST_REQUIRE(condition, msg, retVal) \
     do \
@@ -1714,6 +1812,8 @@ VOID RunBenchmarks(_In_opt_ PVOID pContext)
         LOG_INFO("[OPT_CACHE] \n--- All Tests Finished Successfully ---\n");
     }
 
+    FlushLogToFile();
+
     PsTerminateSystemThread(bTestsPassed ? STATUS_SUCCESS : STATUS_UNSUCCESSFUL);
 }
 
@@ -1743,6 +1843,12 @@ VOID DriverUnload(_In_ PDRIVER_OBJECT pDriverObject)
         g_pMasterBenchmarkThread = NULL;
     }
 
+    if (g_pLogBuffer)
+    {
+        ExFreePoolWithTag(g_pLogBuffer, DRIVER_TAG);
+        g_pLogBuffer = NULL;
+    }
+
     LOG_INFO("[OPT_CACHE] ***Driver Unloaded.\n");
 }
 
@@ -1756,6 +1862,15 @@ extern "C" NTSTATUS DriverEntry(_In_ PDRIVER_OBJECT  pDriverObject,
     PAGED_CODE();
 
     UNREFERENCED_PARAMETER(pRegistryPath);
+
+    ExInitializeFastMutex(&g_LogMutex);
+
+    g_pLogBuffer = (PCHAR)ExAllocatePool2(POOL_FLAG_PAGED, g_cbLogBufferMax, DRIVER_TAG);    
+    if (g_pLogBuffer)
+    {
+        g_pLogBuffer[0]     = '\0';
+        g_cbLogBufferOffset = 0;
+    }
 
     LOG_INFO("[OPT_CACHE] ***DriverEntry Called.\n");
 
