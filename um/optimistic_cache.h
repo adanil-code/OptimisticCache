@@ -549,7 +549,7 @@ public:
             numProcs = 4; // Fallback edge case if OS fails to report cores
         }
 
-        uint32_t targetShards = numProcs * 4;
+        uint32_t targetShards = numProcs * 32;
 
         m_shardCount = std::bit_ceil(targetShards);
         if (m_shardCount > 512) [[unlikely]]

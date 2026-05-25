@@ -75,7 +75,8 @@ struct CacheContextTraits<0>
         return {};
     }
 
-    static __forceinline void Write(_Inout_opt_ volatile void*, _In_ Type)
+    static __forceinline void Write(_Inout_opt_ volatile void*,
+                                    _In_        Type)
     {
     }
 
@@ -95,7 +96,8 @@ struct CacheContextTraits<64>
         return *reinterpret_cast<volatile Type*>(pSource);
     }
 
-    static __forceinline void Write(_Inout_opt_ volatile void* pDest, _In_ Type Value)
+    static __forceinline void Write(_Inout_opt_ volatile void* pDest,
+                                    _In_        Type           Value)
     {
         *reinterpret_cast<volatile Type*>(pDest) = Value;
     }
@@ -116,7 +118,8 @@ struct CacheContextTraits<128>
         return *const_cast<const Type*>(reinterpret_cast<volatile Type*>(pSource));
     }
 
-    static __forceinline void Write(_Inout_opt_ volatile void* pDest, _In_ Type Value)
+    static __forceinline void Write(_Inout_opt_ volatile void* pDest,
+                                    _In_        Type           Value)
     {
         *const_cast<Type*>(reinterpret_cast<volatile Type*>(pDest)) = Value;
     }
@@ -143,14 +146,13 @@ struct CacheContextTraits<128>
 //   odd number, perform the write, and release by incrementing to an even number.
 // 
 // - Hot/Cold Segregation: Cache memory is split. Metadata (Keys and Sequences) 
-//   are packed into "Hot" 64-byte blocks to maximize L1 search density. Payload 
+//   are packed sequentially into "Hot" blocks to maximize L1 search density. Payload 
 //   data is isolated in "Cold" blocks. This prevents large payloads from 
 //   polluting the CPU cache during hash collisions or cache misses.
 // 
-// - Tiered Backoff: When threads encounter a locked sequence (contention), they 
-//   enter an escalating backoff loop. This transitions from lightweight hardware 
-//   hints to OS scheduler yields, and finally hard processor stalls to prevent 
-//   livelock and priority inversion under heavy oversubscription.
+// - Tiered Backoff: When threads encounter a locked sequence, they enter an
+//   escalating backoff loop. This transitions from exponential hardware pauses
+//   to bounded hard processor stalls.
 // ----------------------------------------------------------------------------
 
 template <SIZE_T TContextSize>
@@ -203,11 +205,8 @@ private:
     // ------------------------------------------------------------------------
     struct alignas(64) CacheSetHot
     {
-        struct OptimizedSlot
-        {
-            volatile UINT64 Sequence;
-            volatile UINT64 Key;
-        } Slots[8];
+        volatile UINT64 Keys[8];
+        volatile UINT64 Seqs[8];
     };
 
     // ------------------------------------------------------------------------
@@ -256,75 +255,34 @@ private:
 
     // ------------------------------------------------------------------------
     // ExecuteTieredBackoff
-    // Optimized Tiered Backoff hardened for oversubscription.
-    // Transitions smoothly from hardware hints to scheduler yields, and finally 
-    // to hard execution stalls to prevent priority inversion under extreme load.
+    // Optimized Pure-Hardware Backoff. Completely free of OS scheduler overhead.
     // ------------------------------------------------------------------------
-    static __forceinline void ExecuteTieredBackoff(_In_ ULONG ululRetries)
+    static __forceinline void ExecuteTieredBackoff(_In_ ULONG ulRetries)
     {
-        if (ululRetries < 64)
+        // --------------------------------------------------------------------
+        // Tier 1: SMT-Friendly Exponential Hardware Spin
+        // Progressively increases the number of PAUSE instructions to avoid 
+        // flooding the cache-coherence bus with sequence register reads.
+        // Capped at 64 iterations to limit single-cycle pipeline stalls.
+        // --------------------------------------------------------------------
+        if (ulRetries < 16)
         {
-            YieldProcessor();
+            ULONG ulSpinLimit = 1UL << (ulRetries < 6 ? ulRetries : 6);
+            for (ULONG i = 0; i < ulSpinLimit; ++i)
+            {
+                YieldProcessor(); // Emits hardware PAUSE
+            }
+            
             return;
         }
 
-        if (ululRetries < 256 || KeShouldYieldProcessor())
-        {
-            KIRQL currentIrql = KeGetCurrentIrql();
-
-            if (currentIrql == PASSIVE_LEVEL)
-            {
-                typedef NTSTATUS(NTAPI* PZW_YIELD_EXECUTION)(VOID);
-
-                // --------------------------------------------------------------------
-                // Statics Thread-Safety
-                // Standard C++ static initializers are not reliably thread-safe in the WDK.
-                // We must use InterlockedCompareExchangePointer to prevent concurrent 
-                // threads from overwriting the resolved function pointer.
-                // --------------------------------------------------------------------
-                static volatile PVOID pZwYieldExecutionCached = nullptr;
-                if (pZwYieldExecutionCached == nullptr)
-                {
-                    UNICODE_STRING routineName;
-                    RtlInitUnicodeString(&routineName, L"ZwYieldExecution");
-                    PVOID pResolved = MmGetSystemRoutineAddress(&routineName);
-                    if (pResolved)
-                    {
-                        InterlockedCompareExchangePointer(&pZwYieldExecutionCached, pResolved, nullptr);
-                    }
-                }
-
-                if (pZwYieldExecutionCached)
-                {
-                    reinterpret_cast<PZW_YIELD_EXECUTION>(pZwYieldExecutionCached)();
-                    return;
-                }
-            }
-            else if (currentIrql <= APC_LEVEL)
-            {
-                // --------------------------------------------------------------------
-                // APC_LEVEL Soft-Lock Prevention
-                // At APC_LEVEL, YieldProcessor() (which issues a PAUSE instruction) 
-                // does NOT yield the OS scheduler. If the thread holding the sequence 
-                // lock is suspended at PASSIVE_LEVEL on this same core, the APC_LEVEL 
-                // thread will spin forever, causing a priority inversion soft-lock.
-                // By explicitly using KeDelayExecutionThread here, we allow the 
-                // PASSIVE_LEVEL thread to resume and release the lock.
-                // --------------------------------------------------------------------
-                LARGE_INTEGER timeout;
-                timeout.QuadPart = -10000; // 1ms relative timeout
-                KeDelayExecutionThread(KernelMode, FALSE, &timeout);
-
-                return;
-            }
-
-            // Only hit this fallback if we are at DISPATCH_LEVEL and < 256 retries
-            YieldProcessor();
-
-            return;
-        }
-
-        // Hard stall for DISPATCH_LEVEL threads that have exhausted the spin count
+        // --------------------------------------------------------------------
+        // Tier 2: Heavy Contention Hardware Stall
+        // If a thread retries more than 16 times, multiple cores are thrashing 
+        // the same slot. Instead of yielding to the OS scheduler (which costs 
+        // thousands of cycles), we execute a precise 1-microsecond hardware stall.
+        // This clears the pipeline and allows the cross-core writer to escape.
+        // --------------------------------------------------------------------
         KeStallExecutionProcessor(1);
     }
 
@@ -597,7 +555,7 @@ public:
         for (int i = 0; i < 8; ++i)
         {
             // Optimistic pre-fetch based on a relaxed key read before the seq lock loop
-            if (pHot->Slots[i].Key == ullKey)
+            if (pHot->Keys[i] == ullKey)
             {
                 CACHE_PREFETCH(const_cast<ContextType*>(&pCold[hash & pShard->uMask].Contexts[i]));
             }
@@ -608,16 +566,16 @@ public:
 
             do
             {
-                seq1 = SEQUENCE_LOAD_ACQUIRE(&pHot->Slots[i].Sequence);
+                seq1 = SEQUENCE_LOAD_ACQUIRE(&pHot->Seqs[i]);
                 while (seq1 & 1)
                 {
                     ExecuteTieredBackoff(ulRetries++);
-                    seq1 = pHot->Slots[i].Sequence;
+                    seq1 = pHot->Seqs[i];
                 }
 
                 SEQUENCE_HARDWARE_FENCE();
 
-                verifyKey = pHot->Slots[i].Key;
+                verifyKey = pHot->Keys[i];
                 if (verifyKey != ullKey)
                 {
                     break;
@@ -626,7 +584,7 @@ public:
                 ctx = CacheContextTraits<TContextSize>::Read(&pCold[hash & pShard->uMask].Contexts[i]);
 
                 SEQUENCE_HARDWARE_FENCE();
-                seq2 = pHot->Slots[i].Sequence;
+                seq2 = pHot->Seqs[i];
 
             } while (seq1 != seq2);
 
@@ -672,23 +630,23 @@ public:
 
             do
             {
-                seq1 = SEQUENCE_LOAD_ACQUIRE(&pHot->Slots[i].Sequence);
+                seq1 = SEQUENCE_LOAD_ACQUIRE(&pHot->Seqs[i]);
                 while (seq1 & 1)
                 {
                     ExecuteTieredBackoff(ulRetries++);
-                    seq1 = pHot->Slots[i].Sequence;
+                    seq1 = pHot->Seqs[i];
                 }
 
                 SEQUENCE_HARDWARE_FENCE();
 
-                verifyKey = pHot->Slots[i].Key;
+                verifyKey = pHot->Keys[i];
                 if (verifyKey != ullKey)
                 {
                     break;
                 }
 
                 SEQUENCE_HARDWARE_FENCE();
-                seq2 = pHot->Slots[i].Sequence;
+                seq2 = pHot->Seqs[i];
 
             } while (seq1 != seq2);
 
@@ -752,7 +710,7 @@ public:
 
             for (int i = 0; i < 8; ++i)
             {
-                if (pHot->Slots[i].Key == ullKey)
+                if (pHot->Keys[i] == ullKey)
                 {
                     iTargetIdx = i;
                     bExists = TRUE;
@@ -765,7 +723,7 @@ public:
                     break;
                 }
 
-                if (iTargetIdx == -1 && pHot->Slots[i].Key == 0)
+                if (iTargetIdx == -1 && pHot->Keys[i] == 0)
                 {
                     iTargetIdx = i;
                 }
@@ -777,7 +735,7 @@ public:
                 iTargetIdx = Hasher(ullKey ^ (pShard->uVictimEntropy++) ^ ulGlobalulRetries) & 7;                
             }
 
-            UINT64 seq = pHot->Slots[iTargetIdx].Sequence;
+            UINT64 seq = pHot->Seqs[iTargetIdx];
 
             if ((seq & 1) == 0)
             {
@@ -791,13 +749,13 @@ public:
                 KIRQL oldIrql;
                 KeRaiseIrql(DISPATCH_LEVEL, &oldIrql);
 
-                if (InterlockedCompareExchange64(reinterpret_cast<volatile LONG64*>(&pHot->Slots[iTargetIdx].Sequence),
+                if (InterlockedCompareExchange64(reinterpret_cast<volatile LONG64*>(&pHot->Seqs[iTargetIdx]),
                                                  static_cast<LONG64>(seq + 1),
                                                  static_cast<LONG64>(seq)) == static_cast<LONG64>(seq))
                 {
-                    if (bExists && pHot->Slots[iTargetIdx].Key != ullKey)
+                    if (bExists && pHot->Keys[iTargetIdx] != ullKey)
                     {
-                        InterlockedExchangeAdd64(reinterpret_cast<volatile LONG64*>(&pHot->Slots[iTargetIdx].Sequence),
+                        InterlockedExchangeAdd64(reinterpret_cast<volatile LONG64*>(&pHot->Seqs[iTargetIdx]),
                                                  1);
                         KeLowerIrql(oldIrql); // Release lock and restore IRQL
 
@@ -825,7 +783,7 @@ public:
                                 continue;
                             }
 
-                            UINT64 seqVerify = SEQUENCE_LOAD_ACQUIRE(&pHot->Slots[verifyIdx].Sequence);
+                            UINT64 seqVerify = SEQUENCE_LOAD_ACQUIRE(&pHot->Seqs[verifyIdx]);
                             if (seqVerify & 1)
                             {
                                 bCollisionOrLocked = TRUE;
@@ -834,7 +792,7 @@ public:
 
                             SEQUENCE_HARDWARE_FENCE();
 
-                            if (pHot->Slots[verifyIdx].Key == ullKey)
+                            if (pHot->Keys[verifyIdx] == ullKey)
                             {
                                 bCollisionOrLocked = TRUE;
                                 break;
@@ -844,7 +802,7 @@ public:
                         if (bCollisionOrLocked)
                         {
                             // Another thread is touching this set. Drop lock and retry.
-                            InterlockedExchangeAdd64(reinterpret_cast<volatile LONG64*>(&pHot->Slots[iTargetIdx].Sequence),
+                            InterlockedExchangeAdd64(reinterpret_cast<volatile LONG64*>(&pHot->Seqs[iTargetIdx]),
                                                      1);
                             KeLowerIrql(oldIrql);
 
@@ -863,7 +821,7 @@ public:
                     if (!bExists)
                     {
                         // Eviction capture logic
-                        UINT64 oldKey = pHot->Slots[iTargetIdx].Key;
+                        UINT64 oldKey = pHot->Keys[iTargetIdx];
                         if (oldKey != 0)
                         {
                             if (pOutEvictedKey != nullptr)
@@ -883,7 +841,7 @@ public:
 
                     if (!bExists || policy == InsertPolicy::Overwrite)
                     {
-                        pHot->Slots[iTargetIdx].Key = ullKey;
+                        pHot->Keys[iTargetIdx] = ullKey;
 
                         if constexpr (TContextSize > 0)
                         {
@@ -893,7 +851,7 @@ public:
                         SEQUENCE_HARDWARE_FENCE();
                     }
 
-                    InterlockedExchangeAdd64(reinterpret_cast<volatile LONG64*>(&pHot->Slots[iTargetIdx].Sequence), 1);
+                    InterlockedExchangeAdd64(reinterpret_cast<volatile LONG64*>(&pHot->Seqs[iTargetIdx]), 1);
                     KeLowerIrql(oldIrql); // Successful exit, restore IRQL
 
                     return bExists ? InsertResult::Updated : InsertResult::Inserted;
@@ -942,7 +900,7 @@ public:
 
         for (int i = 0; i < 8; ++i)
         {
-            if (pHot->Slots[i].Key == ullKey)
+            if (pHot->Keys[i] == ullKey)
             {
                 if constexpr (TContextSize > 0)
                 {
@@ -954,7 +912,7 @@ public:
 
                 while (true)
                 {
-                    UINT64 seq = pHot->Slots[i].Sequence;
+                    UINT64 seq = pHot->Seqs[i];
                     if ((seq & 1) == 0)
                     {
                         // --------------------------------------------------------------------
@@ -965,13 +923,13 @@ public:
                         KIRQL oldIrql;
                         KeRaiseIrql(DISPATCH_LEVEL, &oldIrql);
 
-                        if (InterlockedCompareExchange64(reinterpret_cast<volatile LONG64*>(&pHot->Slots[i].Sequence),
+                        if (InterlockedCompareExchange64(reinterpret_cast<volatile LONG64*>(&pHot->Seqs[i]),
                                                          static_cast<LONG64>(seq + 1),
                                                          static_cast<LONG64>(seq)) == static_cast<LONG64>(seq))
                         {
-                            if (pHot->Slots[i].Key == ullKey)
+                            if (pHot->Keys[i] == ullKey)
                             {
-                                pHot->Slots[i].Key = 0;
+                                pHot->Keys[i] = 0;
 
                                 if constexpr (TContextSize > 0)
                                 {
@@ -986,14 +944,14 @@ public:
                                 }
 
                                 SEQUENCE_HARDWARE_FENCE();
-                                InterlockedExchangeAdd64(reinterpret_cast<volatile LONG64*>(&pHot->Slots[i].Sequence),
+                                InterlockedExchangeAdd64(reinterpret_cast<volatile LONG64*>(&pHot->Seqs[i]),
                                                          1);
                                 KeLowerIrql(oldIrql);
 
                                 return TRUE;
                             }
 
-                            InterlockedExchangeAdd64(reinterpret_cast<volatile LONG64*>(&pHot->Slots[i].Sequence),
+                            InterlockedExchangeAdd64(reinterpret_cast<volatile LONG64*>(&pHot->Seqs[i]),
                                                      1);
                             KeLowerIrql(oldIrql);
 
@@ -1054,15 +1012,15 @@ public:
 
                     do
                     {
-                        seq1 = SEQUENCE_LOAD_ACQUIRE(&pHot->Slots[k].Sequence);
+                        seq1 = SEQUENCE_LOAD_ACQUIRE(&pHot->Seqs[k]);
                         while (seq1 & 1)
                         {
                             ExecuteTieredBackoff(ulRetries++);
-                            seq1 = pHot->Slots[k].Sequence;
+                            seq1 = pHot->Seqs[k];
                         }
 
                         SEQUENCE_HARDWARE_FENCE();
-                        key = pHot->Slots[k].Key;
+                        key = pHot->Keys[k];
 
                         if constexpr (TContextSize > 0)
                         {
@@ -1070,7 +1028,7 @@ public:
                         }
 
                         SEQUENCE_HARDWARE_FENCE();
-                        seq2 = pHot->Slots[k].Sequence;
+                        seq2 = pHot->Seqs[k];
 
                     } while (seq1 != seq2);
 
