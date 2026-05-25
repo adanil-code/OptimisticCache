@@ -292,7 +292,8 @@ struct CacheContextTraits<0>
 
     static inline void Write(void* dest,
                              Type  value)
-    {}
+    {
+    }
 };
 
 template <>
@@ -518,7 +519,8 @@ public:
                         m_shardsBase(nullptr),
                         m_shardsBaseSize(0),
                         m_shardCount(0)
-    {}
+    {
+    }
 
     ~OptimisticCache()
     {
@@ -552,9 +554,11 @@ public:
         uint32_t targetShards = numProcs * 32;
 
         m_shardCount = std::bit_ceil(targetShards);
-        if (m_shardCount > 512) [[unlikely]]
+        
+        // Cap shards to prevent extreme memory fragmentation
+        if (m_shardCount > 4096) [[unlikely]]
         {
-            m_shardCount = 512; // Cap shards to prevent extreme memory fragmentation
+            m_shardCount = 4096; 
         }
 
         const std::vector<uint32_t>& validNumaNodes = TAllocator::GetValidNodes();
@@ -741,7 +745,7 @@ public:
     }
 
     InsertResult CheckAndInsert(uint64_t    key,
-        ContextType context)
+                                ContextType context)
     {
         return CheckAndInsert(key, context, InsertPolicy::Overwrite, nullptr, nullptr, nullptr);
     }
@@ -842,12 +846,12 @@ public:
                     // --------------------------------------------------------------------
                     // Lock-Free Set-Level Abort (Duplicate Race Mitigation)
                     // If we initially scanned and found the key didn't exist, we must re-verify.
-                    // If ANY other slot is currently locked (odd sequence) or already contains 
-                    // the key, another thread might be actively inserting the exact same key. 
-                    // We must mathematically guarantee mutual exclusion to prevent duplicate 
-                    // keys from polluting the set. We drop our lock and abort.
+                    // We scan the other 7 slots. If another slot is locked (odd sequence), 
+                    // we wait for it to resolve rather than dropping our lock, completely 
+                    // eliminating the Set-Level Abort livelock on highly multicore systems.
+                    // We only drop our lock and abort if an actual duplicate key is found.
                     // --------------------------------------------------------------------
-                    bool collisionOrLocked = false;
+                    bool duplicateFound = false;
 
                     for (int verifyIdx = 0; verifyIdx < 8; ++verifyIdx)
                     {
@@ -856,26 +860,37 @@ public:
                             continue;
                         }
 
-                        uint64_t seqVerify = hotSet->Seqs[verifyIdx].load(std::memory_order_acquire);
-                        if ((seqVerify & 1) != 0)
-                        {
-                            collisionOrLocked = true;
-                            break;
-                        }
+                        uint64_t seqVerify;
+                        uint64_t keyVerify;
 
-                        // Use an acquire fence to ensure the sequence state was verified before reading the key
-                        std::atomic_thread_fence(std::memory_order_acquire);
-
-                        if (hotSet->Keys[verifyIdx].load(std::memory_order_relaxed) == key)
+                        do
                         {
-                            collisionOrLocked = true;
+                            seqVerify = hotSet->Seqs[verifyIdx].load(std::memory_order_acquire);
+                            
+                            if ((seqVerify & 1) != 0) [[unlikely]]
+                            {
+                                YieldProcessorThread();
+                                continue;
+                            }
+
+                            keyVerify = hotSet->Keys[verifyIdx].load(std::memory_order_relaxed);
+
+                            // Use an acquire fence to ensure the sequence state was verified before reading the key
+                            std::atomic_thread_fence(std::memory_order_acquire);
+                            
+                        } while (seqVerify != hotSet->Seqs[verifyIdx].load(std::memory_order_relaxed));
+
+                        if (keyVerify == key) [[unlikely]]
+                        {
+                            duplicateFound = true;
                             break;
                         }
                     }
 
-                    if (collisionOrLocked) [[unlikely]]
+                    if (duplicateFound) [[unlikely]]
                     {
-                        // Another thread is interacting with this set. Drop lock and restart state machine.
+                        // Another thread is interacting with this set and actually inserted the exact same key.
+                        // Drop lock and restart state machine (will hit the Update path on next loop).
                         hotSet->Seqs[victimIndex].store(seq + 2, std::memory_order_release);
                         continue;
                     }
