@@ -314,22 +314,52 @@ inline VOID RtlInitUnicodeString(_Out_    PUNICODE_STRING DestinationString,
                                  _In_opt_ PCWSTR          SourceString)
 {
     typedef VOID(NTAPI* PRTL_INIT_UNICODE_STRING)(PUNICODE_STRING, PCWSTR);
-    static PRTL_INIT_UNICODE_STRING pRtlInit = nullptr;
 
-    if (pRtlInit == nullptr)
+    static PRTL_INIT_UNICODE_STRING pRtlInit = []() -> PRTL_INIT_UNICODE_STRING
     {
-        // ntdll.dll is always loaded, so GetModuleHandle is safe and fast
         HMODULE hNtdll = GetModuleHandleW(L"ntdll.dll");
         if (hNtdll)
         {
-            pRtlInit = (PRTL_INIT_UNICODE_STRING)GetProcAddress(hNtdll, "RtlInitUnicodeString");
+            return reinterpret_cast<PRTL_INIT_UNICODE_STRING>(GetProcAddress(hNtdll, "RtlInitUnicodeString"));
         }
-    }
+
+        return nullptr;
+    }();
 
     if (pRtlInit)
     {
         pRtlInit(DestinationString, SourceString);
     }
+}
+
+// Dynamically resolve and call QueryInterruptTime from kernel32.dll
+inline UINT64 KeQueryInterruptTime()
+{
+    typedef VOID(WINAPI* PFN_QIT)(PULONGLONG);
+
+    static PFN_QIT pfnQueryInterruptTime = []() -> PFN_QIT
+    {
+        HMODULE hMod = GetModuleHandleW(L"kernel32.dll");
+        if (hMod)
+        {
+            return reinterpret_cast<PFN_QIT>(GetProcAddress(hMod, "QueryInterruptTime"));
+        }
+
+        return nullptr;
+    }();
+
+    ULONGLONG ullTime = 0;
+
+    if (pfnQueryInterruptTime)
+    {
+        pfnQueryInterruptTime(&ullTime);
+    }
+    else
+    {
+        ullTime = GetTickCount64() * 10000ULL;
+    }
+
+    return static_cast<UINT64>(ullTime);
 }
 
 // ----------------------------------------------------------------------------

@@ -669,40 +669,40 @@ public:
     //   InsertResult::Updated if an existing key was successfully overwritten.
     //   InsertResult::Failed if the table is uninitialized or the key is invalid (0).
     // ------------------------------------------------------------------------
-    InsertResult CheckAndInsert(_In_      UINT64       ullKey,
-                                _In_      ContextType  Context,
-                                _In_      InsertPolicy policy = InsertPolicy::Overwrite,
-                                _Out_opt_ ContextType* pOutExistingContext = nullptr,
-                                _Out_opt_ UINT64*      pOutEvictedKey = nullptr,
-                                _Out_opt_ ContextType* pOutEvictedContext = nullptr)
+InsertResult CheckAndInsert(_In_      UINT64       ullKey,
+                            _In_      ContextType  Context,
+                            _In_      InsertPolicy policy              = InsertPolicy::Overwrite,
+                            _Out_opt_ ContextType* pOutExistingContext = nullptr,
+                            _Out_opt_ UINT64*      pOutEvictedKey      = nullptr,
+                            _Out_opt_ ContextType* pOutEvictedContext  = nullptr)
     {
         if (m_pShards == nullptr || ullKey == 0)
         {
             return InsertResult::Failed;
         }
 
-        UINT64 hash   = Hasher(ullKey);
-        Shard* pShard = &m_pShards[static_cast<ULONG>((hash >> 48) ^ (hash >> 56)) & (m_ulShardCount - 1)];
+        UINT64 hash    = Hasher(ullKey);
+        Shard* pShard  = &m_pShards[static_cast<ULONG>((hash >> 48) ^ (hash >> 56)) & (m_ulShardCount - 1)];
+        SIZE_T uSetIdx = hash & pShard->uMask;
 
-        SIZE_T        uSetIdx = hash & pShard->uMask;
-        CacheSetHot*  pHot    = &pShard->pSetsHot[uSetIdx];
-        CacheSetCold* pCold   = pShard->pSetsCold;
-
-        UINT64 ullThreadPtr = reinterpret_cast<UINT64>(KeGetCurrentThread());
+        CacheSetHot*  pHot  = &pShard->pSetsHot[uSetIdx];
+        CacheSetCold* pCold = pShard->pSetsCold;        
 
         ULONG ulGlobalRetries = 0;
 
         while (true)
         {
-            int iTargetIdx = -1;
-            BOOLEAN bExists = FALSE;
+            int     iTargetIdx = -1;
+            BOOLEAN bExists    = FALSE;
 
             for (int i = 0; i < 8; ++i)
-            {
-                if (pHot->Keys[i] == ullKey)
+            {                
+                UINT64 currentKey = pHot->Keys[i];
+
+                if (currentKey == ullKey)
                 {
                     iTargetIdx = i;
-                    bExists = TRUE;
+                    bExists    = TRUE;
 
                     if constexpr (TContextSize > 0)
                     {
@@ -712,146 +712,171 @@ public:
                     break;
                 }
 
-                if (iTargetIdx == -1 && pHot->Keys[i] == 0)
+                if (iTargetIdx == -1 && currentKey == 0)
                 {
                     iTargetIdx = i;
                 }
             }
 
-            if (iTargetIdx == -1)
-            {                
-                UINT64 ullThreadSalt = (ullThreadPtr >> 6) * 0x9E3779B97F4A7C15ULL;
-
-                // Mix the key, the retry count and thread salt                 
-                iTargetIdx = Hasher(ullKey ^ ullThreadSalt ^ ulGlobalRetries) & 7;
+            // --------------------------------------------------------------------
+            // Fast-Path Lock Bypass
+            // If the key exists, we aren't overwriting, and we aren't requested 
+            // to fetch the old data, we can return instantly without dirtying 
+            // the sequence lock cache line.
+            // --------------------------------------------------------------------
+            if (bExists && policy == InsertPolicy::KeepExisting && pOutExistingContext == nullptr)
+            {
+                return InsertResult::Updated;
             }
 
-            UINT64 seq = pHot->Seqs[iTargetIdx];
+            if (iTargetIdx == -1)
+            {
+                UINT64 ullThreadPtr  = reinterpret_cast<UINT64>(KeGetCurrentThread());
+                UINT64 ullThreadSalt = (ullThreadPtr >> 6) * 0x9E3779B97F4A7C15ULL;
+                UINT64 ullTemporal   = KeQueryInterruptTime();
 
-            if ((seq & 1) == 0)
+                // Mix the key, thread salt, 1-cycle temporal state, and retry count
+                iTargetIdx = Hasher(ullKey ^ ullThreadSalt ^ ullTemporal ^ ulGlobalRetries) & 7;
+            }
+
+            UINT64 seq = SEQUENCE_LOAD_ACQUIRE(&pHot->Seqs[iTargetIdx]);
+
+            if constexpr (TContextSize > 64)
             {
                 // --------------------------------------------------------------------
-                // Preemptible Writer Livelock Prevention
-                // We MUST raise the IRQL to DISPATCH_LEVEL before locking the sequence.
-                // If a writer holds the lock (odd sequence) at PASSIVE_LEVEL and gets 
-                // preempted by a DPC on the same core, the DPC will spin forever waiting 
-                // for the lock to release, causing a Bugcheck 0x133.
+                // Targeted Read-Only Spin (Prefetch Storm Mitigation)
+                // By spinning locally on the sequence, we prevent the thread from 
+                // rapidly restarting the outer loop and flooding the memory controller 
+                // with CACHE_PREFETCH instructions during 128-bit payload writes.
                 // --------------------------------------------------------------------
-                KIRQL oldIrql;
-                KeRaiseIrql(DISPATCH_LEVEL, &oldIrql);
+                ULONG ulLocalSpin = 0;
 
-                if (InterlockedCompareExchange64(reinterpret_cast<volatile LONG64*>(&pHot->Seqs[iTargetIdx]),
-                                                 static_cast<LONG64>(seq + 1),
-                                                 static_cast<LONG64>(seq)) == static_cast<LONG64>(seq))
+                while ((seq & 1) != 0 && ulLocalSpin < 32)
                 {
-                    if (bExists && pHot->Keys[iTargetIdx] != ullKey)
+                    ExecuteTieredBackoff(ulLocalSpin++);
+                    seq = SEQUENCE_LOAD_ACQUIRE(&pHot->Seqs[iTargetIdx]);
+                }
+            }
+
+            // --------------------------------------------------------------------
+            // Preemptible Writer Livelock Prevention
+            // We MUST raise the IRQL to DISPATCH_LEVEL before locking the sequence.
+            // If a writer holds the lock (odd sequence) at PASSIVE_LEVEL and gets 
+            // preempted by a DPC on the same core, the DPC will spin forever waiting 
+            // for the lock to release, causing a Bugcheck 0x133.
+            // --------------------------------------------------------------------
+            KIRQL oldIrql;
+            KeRaiseIrql(DISPATCH_LEVEL, &oldIrql);
+
+            if (InterlockedCompareExchange64(reinterpret_cast<volatile LONG64*>(&pHot->Seqs[iTargetIdx]),
+                                             static_cast<LONG64>(seq + 1),
+                                             static_cast<LONG64>(seq)) == static_cast<LONG64>(seq))
+            {
+                if (bExists && pHot->Keys[iTargetIdx] != ullKey)
+                {
+                    InterlockedExchangeAdd64(reinterpret_cast<volatile LONG64*>(&pHot->Seqs[iTargetIdx]),
+                                             1);
+                    KeLowerIrql(oldIrql); 
+                    ExecuteTieredBackoff(ulGlobalRetries++);
+                    continue;
+                }
+
+                // --------------------------------------------------------------------
+                // STRICT DUPLICATE PREVENTION: Set-Level Abort
+                // Re-verify the set AFTER acquiring our slot lock to ensure no 
+                // concurrent thread sneaked the exact same key into a different slot.
+                // We MUST abort and drop the lock if we see another locked slot to 
+                // prevent DISPATCH_LEVEL circular-wait deadlocks.
+                // --------------------------------------------------------------------
+                if (!bExists)
+                {
+                    BOOLEAN bCollisionOrLocked = FALSE;
+
+                    for (int verifyIdx = 0; verifyIdx < 8; ++verifyIdx)
                     {
-                        InterlockedExchangeAdd64(reinterpret_cast<volatile LONG64*>(&pHot->Seqs[iTargetIdx]),
-                                                 1);
-                        KeLowerIrql(oldIrql); // Release lock and restore IRQL
-
-                        continue;
-                    }
-
-                    // --------------------------------------------------------------------
-                    // Set-Level Deadlock & Duplicate Mitigation
-                    // If we initially found the key didn't exist, we must re-verify.
-                    // However, we CANNOT spin-wait for other slots in the set to unlock,
-                    // because if two threads lock two different slots in the same set 
-                    // and wait for each other at DISPATCH_LEVEL, they will DEADLOCK.
-                    // Instead, we perform a lock-free check. If ANY other slot is locked
-                    // or already contains the key, we immediately abort, drop our lock, 
-                    // and retry.
-                    // --------------------------------------------------------------------
-                    if (!bExists)
-                    {
-                        BOOLEAN bCollisionOrLocked = FALSE;
-
-                        for (int verifyIdx = 0; verifyIdx < 8; ++verifyIdx)
+                        if (verifyIdx == iTargetIdx)
                         {
-                            if (verifyIdx == iTargetIdx)
-                            {
-                                continue;
-                            }
-
-                            UINT64 seqVerify = SEQUENCE_LOAD_ACQUIRE(&pHot->Seqs[verifyIdx]);
-                            if (seqVerify & 1)
-                            {
-                                bCollisionOrLocked = TRUE;
-                                break;
-                            }
-
-                            SEQUENCE_HARDWARE_FENCE();
-
-                            if (pHot->Keys[verifyIdx] == ullKey)
-                            {
-                                bCollisionOrLocked = TRUE;
-                                break;
-                            }
-                        }
-
-                        if (bCollisionOrLocked)
-                        {
-                            // Another thread is touching this set. Drop lock and retry.
-                            InterlockedExchangeAdd64(reinterpret_cast<volatile LONG64*>(&pHot->Seqs[iTargetIdx]),
-                                                     1);
-                            KeLowerIrql(oldIrql);
-
                             continue;
                         }
-                    }
 
-                    if constexpr (TContextSize > 0)
-                    {
-                        if (bExists && pOutExistingContext != nullptr)
+                        UINT64 seqVerify = SEQUENCE_LOAD_ACQUIRE(&pHot->Seqs[verifyIdx]);
+                        if (seqVerify & 1)
                         {
-                            *pOutExistingContext = CacheContextTraits<TContextSize>::Read(&pCold[hash & pShard->uMask].Contexts[iTargetIdx]);
-                        }
-                    }
-
-                    if (!bExists)
-                    {
-                        // Eviction capture logic
-                        UINT64 oldKey = pHot->Keys[iTargetIdx];
-                        if (oldKey != 0)
-                        {
-                            if (pOutEvictedKey != nullptr)
-                            {
-                                *pOutEvictedKey = oldKey;
-                            }
-
-                            if constexpr (TContextSize > 0)
-                            {
-                                if (pOutEvictedContext != nullptr)
-                                {
-                                    *pOutEvictedContext = CacheContextTraits<TContextSize>::Read(&pCold[hash & pShard->uMask].Contexts[iTargetIdx]);
-                                }
-                            }
-                        }
-                    }
-
-                    if (!bExists || policy == InsertPolicy::Overwrite)
-                    {
-                        pHot->Keys[iTargetIdx] = ullKey;
-
-                        if constexpr (TContextSize > 0)
-                        {
-                            CacheContextTraits<TContextSize>::Write(&pCold[hash & pShard->uMask].Contexts[iTargetIdx], Context);
+                            bCollisionOrLocked = TRUE;
+                            break;
                         }
 
                         SEQUENCE_HARDWARE_FENCE();
+
+                        if (pHot->Keys[verifyIdx] == ullKey)
+                        {
+                            bCollisionOrLocked = TRUE;
+                            break;
+                        }
                     }
 
-                    InterlockedExchangeAdd64(reinterpret_cast<volatile LONG64*>(&pHot->Seqs[iTargetIdx]), 1);
-                    KeLowerIrql(oldIrql); // Successful exit, restore IRQL
-
-                    return bExists ? InsertResult::Updated : InsertResult::Inserted;
+                    if (bCollisionOrLocked)
+                    {
+                        // --------------------------------------------------------------------
+                        // Another thread is actively modifying this set, or the key 
+                        // was just inserted. Drop lock to prevent deadlock and retry.
+                        // --------------------------------------------------------------------
+                        InterlockedExchangeAdd64(reinterpret_cast<volatile LONG64*>(&pHot->Seqs[iTargetIdx]), 1);
+                        KeLowerIrql(oldIrql);
+                        ExecuteTieredBackoff(ulGlobalRetries++);
+                        continue;
+                    }
                 }
 
-                // Lock acquisition failed, lower IRQL before entering the backoff spin
-                KeLowerIrql(oldIrql);
+                if constexpr (TContextSize > 0)
+                {
+                    if (bExists && pOutExistingContext != nullptr)
+                    {
+                        *pOutExistingContext = CacheContextTraits<TContextSize>::Read(&pCold[uSetIdx].Contexts[iTargetIdx]);
+                    }
+                }
+
+                if (!bExists)
+                {
+                    // Eviction capture logic
+                    UINT64 oldKey = pHot->Keys[iTargetIdx];
+                    if (oldKey != 0)
+                    {
+                        if (pOutEvictedKey != nullptr)
+                        {
+                            *pOutEvictedKey = oldKey;
+                        }
+
+                        if constexpr (TContextSize > 0)
+                        {
+                            if (pOutEvictedContext != nullptr)
+                            {
+                                *pOutEvictedContext = CacheContextTraits<TContextSize>::Read(&pCold[uSetIdx].Contexts[iTargetIdx]);
+                            }
+                        }
+                    }
+                }
+
+                if (!bExists || policy == InsertPolicy::Overwrite)
+                {
+                    pHot->Keys[iTargetIdx] = ullKey;
+
+                    if constexpr (TContextSize > 0)
+                    {
+                        CacheContextTraits<TContextSize>::Write(&pCold[uSetIdx].Contexts[iTargetIdx], Context);
+                    }
+
+                    SEQUENCE_HARDWARE_FENCE();
+                }
+
+                InterlockedExchangeAdd64(reinterpret_cast<volatile LONG64*>(&pHot->Seqs[iTargetIdx]), 1);
+                KeLowerIrql(oldIrql); // Successful exit, restore IRQL
+
+                return bExists ? InsertResult::Updated : InsertResult::Inserted;
             }
 
+            // Lock acquisition failed, lower IRQL before backing off and returning to the top
+            KeLowerIrql(oldIrql);
             ExecuteTieredBackoff(ulGlobalRetries++);
         }
     }

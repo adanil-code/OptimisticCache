@@ -424,14 +424,14 @@ public:
     {
         void* RawMemoryBlock;  // Base pointer for accurate allocator deallocation
         size_t        AllocationSize;  // Exact size allocated on the NUMA node
-        CacheSetHot* HotSets;         // Pointer to the contiguous block of Hot metadata sets
+        CacheSetHot*  HotSets;         // Pointer to the contiguous block of Hot metadata sets
         CacheSetCold* ColdSets;        // Pointer to the contiguous block of Cold payload sets
         size_t        Mask;            // Bitwise mask used to rapidly route hashes to specific buckets
     };
 
 private:
-    Shard* m_shards;                 // Aligned array of cache shards used to distribute workload and minimize lock contention
-    void* m_shardsBase;             // Raw pointer for proper NUMA allocator deallocation
+    Shard*   m_shards;                 // Aligned array of cache shards used to distribute workload and minimize lock contention
+    void*    m_shardsBase;             // Raw pointer for proper NUMA allocator deallocation
     size_t   m_shardsBaseSize;         // Total byte size of the raw memory allocation required to safely free the block
     uint32_t m_shardCount;             // Total number of shards, guaranteed to be a power of two for fast bitwise hash routing
 
@@ -763,13 +763,13 @@ public:
             return InsertResult::Failed;
         }
 
-        uint64_t hash = Hasher(key);
+        uint64_t hash       = Hasher(key);
         uint32_t shardIndex = static_cast<uint32_t>((hash >> 48) ^ (hash >> 56)) & (m_shardCount - 1);
-        Shard* shard      = &m_shards[shardIndex];
+        Shard*   shard      = &m_shards[shardIndex];
 
-        size_t setIndex = (hash ^ (hash >> 32)) & shard->Mask;
-        CacheSetHot* hotSet  = &shard->HotSets[setIndex];
-        CacheSetCold* coldSet = shard->ColdSets;
+        size_t        setIndex = (hash ^ (hash >> 32)) & shard->Mask;
+        CacheSetHot*  hotSet   = &shard->HotSets[setIndex];
+        CacheSetCold* coldSet  = shard->ColdSets;
 
         uint32_t globalRetries = 0;
 
@@ -789,9 +789,11 @@ public:
 
                 while (true)
                 {
-                    if ((seq & 1) == 0) [[likely]] // Lock is likely unheld
+                    if ((seq & 1) == 0) [[likely]]
                     {
-                        if (hotSet->Seqs[hitIndex].compare_exchange_weak(seq, seq + 1, std::memory_order_acquire, std::memory_order_relaxed)) [[likely]]
+                        // Lock for UPDATE (Bit 0 = 1, Intent Bit = 0)
+                        uint64_t lockedSeq = seq | 1;
+                        if (hotSet->Seqs[hitIndex].compare_exchange_weak(seq, lockedSeq, std::memory_order_acquire, std::memory_order_relaxed)) [[likely]]
                         {
                             // Post-lock validation: confirm key wasn't deleted or changed by a concurrent writer
                             if (hotSet->Keys[hitIndex].load(std::memory_order_relaxed) == key) [[likely]]
@@ -809,17 +811,18 @@ public:
                                     }
                                 }
 
-                                // True publish point. Implicitly releases the prior relaxed payload writes.
-                                hotSet->Seqs[hitIndex].store(seq + 2, std::memory_order_release);
-
+                                // Unlock and increment version (clears bit 0 and 1). 
+                                // Implicitly releases the prior relaxed payload writes.
+                                hotSet->Seqs[hitIndex].store((seq + 4) & ~3ULL, std::memory_order_release);
                                 return InsertResult::Updated;
                             }
 
-                            hotSet->Seqs[hitIndex].store(seq + 2, std::memory_order_release);
-                            break;
+                            // Key moved. Abort lock and allow the outer FindHitIndex loop to re-scan.                            
+                            hotSet->Seqs[hitIndex].store((seq + 4) & ~3ULL, std::memory_order_release);
+                            break; 
                         }
                     }
-                    else [[unlikely]] // Lock contention
+                    else [[unlikely]]
                     {
                         ExecuteTieredBackoff(globalRetries++);
                         seq = hotSet->Seqs[hitIndex].load(std::memory_order_relaxed);
@@ -841,16 +844,22 @@ public:
             uint64_t seq = hotSet->Seqs[victimIndex].load(std::memory_order_relaxed);
             if ((seq & 1) == 0) [[likely]]
             {
-                if (hotSet->Seqs[victimIndex].compare_exchange_weak(seq, seq + 1, std::memory_order_acquire, std::memory_order_relaxed)) [[likely]]
+                // Lock for INSERT (Bit 0 = 1, Intent Bit = 1)
+                uint64_t lockedSeq = seq | 3;
+                if (hotSet->Seqs[victimIndex].compare_exchange_weak(seq, lockedSeq, std::memory_order_acquire, std::memory_order_relaxed)) [[likely]]
                 {
+                    uint64_t oldKey = hotSet->Keys[victimIndex].load(std::memory_order_relaxed);
+                    
                     // --------------------------------------------------------------------
                     // Lock-Free Set-Level Abort (Duplicate Race Mitigation)
                     // If we initially scanned and found the key didn't exist, we must re-verify.
-                    // We scan the other 7 slots. If another slot is locked (odd sequence), 
-                    // we wait for it to resolve rather than dropping our lock, completely 
-                    // eliminating the Set-Level Abort livelock on highly multicore systems.
-                    // We only drop our lock and abort if an actual duplicate key is found.
+                    // Pre-publish intent immediately, followed by a seq_cst fence (Dekker's Algorithm).
+                    // This allows completely concurrent bucket writes, only aborting if 
+                    // the EXACT SAME KEY is detected in another slot.
                     // --------------------------------------------------------------------
+                    hotSet->Keys[victimIndex].store(key, std::memory_order_relaxed);
+                    std::atomic_thread_fence(std::memory_order_seq_cst);
+
                     bool duplicateFound = false;
 
                     for (int verifyIdx = 0; verifyIdx < 8; ++verifyIdx)
@@ -860,43 +869,41 @@ public:
                             continue;
                         }
 
-                        uint64_t seqVerify;
-                        uint64_t keyVerify;
-
-                        do
-                        {
-                            seqVerify = hotSet->Seqs[verifyIdx].load(std::memory_order_acquire);
-                            
-                            if ((seqVerify & 1) != 0) [[unlikely]]
-                            {
-                                YieldProcessorThread();
-                                continue;
-                            }
-
-                            keyVerify = hotSet->Keys[verifyIdx].load(std::memory_order_relaxed);
-
-                            // Use an acquire fence to ensure the sequence state was verified before reading the key
-                            std::atomic_thread_fence(std::memory_order_acquire);
-                            
-                        } while (seqVerify != hotSet->Seqs[verifyIdx].load(std::memory_order_relaxed));
+                        uint64_t seqVerify = hotSet->Seqs[verifyIdx].load(std::memory_order_acquire);
+                        uint64_t keyVerify = hotSet->Keys[verifyIdx].load(std::memory_order_relaxed);
 
                         if (keyVerify == key) [[unlikely]]
                         {
-                            duplicateFound = true;
-                            break;
+                            if ((seqVerify & 3) == 3)
+                            {
+                                // Both threads are concurrently inserting! Tie-breaker logic.
+                                if (victimIndex < verifyIdx)
+                                {
+                                    duplicateFound = true;
+                                    break;
+                                }
+                            }
+                            else
+                            {
+                                // The other slot holds an established key or is actively updating.
+                                duplicateFound = true;
+                                break;
+                            }
                         }
                     }
 
                     if (duplicateFound) [[unlikely]]
                     {
-                        // Another thread is interacting with this set and actually inserted the exact same key.
-                        // Drop lock and restart state machine (will hit the Update path on next loop).
-                        hotSet->Seqs[victimIndex].store(seq + 2, std::memory_order_release);
+                        // Another thread inserted our key. 
+                        // Abort insert. Restore key to prevent false reader invalidations.
+                        hotSet->Keys[victimIndex].store(oldKey, std::memory_order_relaxed);                        
+                        hotSet->Seqs[victimIndex].store((seq + 4) & ~3ULL, std::memory_order_release);
+                        
+                        ExecuteTieredBackoff(globalRetries++);
                         continue;
                     }
 
                     // Eviction capture logic
-                    uint64_t oldKey = hotSet->Keys[victimIndex].load(std::memory_order_relaxed);
                     if (oldKey != 0)
                     {
                         if (outEvictedKey)
@@ -918,13 +925,11 @@ public:
                         CacheContextTraits<TContextSize>::Write(&coldSet[setIndex].Contexts[victimIndex], context);
                     }
 
-                    // Ensure context writes are fully globally visible before the key is published
+                    // Ensure context writes are fully globally visible before the lock is published
                     std::atomic_thread_fence(std::memory_order_release);
-
-                    hotSet->Keys[victimIndex].store(key, std::memory_order_relaxed);
-
-                    // Release the slot lock. This formally publishes the key and context.
-                    hotSet->Seqs[victimIndex].store(seq + 2, std::memory_order_release);
+                    
+                    // Unlock and increment version (clears bit 0 and 1). This formally publishes the key and context.
+                    hotSet->Seqs[victimIndex].store((seq + 4) & ~3ULL, std::memory_order_release);
 
                     return InsertResult::Inserted;
                 }
@@ -959,18 +964,23 @@ public:
             return false;
         }
 
-        uint64_t hash = Hasher(key);
+        uint64_t hash       = Hasher(key);
         uint32_t shardIndex = static_cast<uint32_t>((hash >> 48) ^ (hash >> 56)) & (m_shardCount - 1);
-        Shard* shard      = &m_shards[shardIndex];
+        Shard*   shard      = &m_shards[shardIndex];
 
-        size_t setIndex = (hash ^ (hash >> 32)) & shard->Mask;
-        CacheSetHot* hotSet  = &shard->HotSets[setIndex];
-        CacheSetCold* coldSet = shard->ColdSets;
+        size_t        setIndex = (hash ^ (hash >> 32)) & shard->Mask;
+        CacheSetHot*  hotSet   = &shard->HotSets[setIndex];
+        CacheSetCold* coldSet  = shard->ColdSets;
 
-        int hitIndex = FindHitIndex(hotSet, key);
-
-        if (hitIndex != -1) [[likely]]
+        while (true)
         {
+            int hitIndex = FindHitIndex(hotSet, key);
+
+            if (hitIndex == -1) 
+            {
+                return false;
+            }
+
             // Pre-fetch cold data early while the CPU executes the sequence lock instructions
             CACHE_PREFETCH(const_cast<ContextType*>(&coldSet[setIndex].Contexts[hitIndex]));
 
@@ -979,7 +989,7 @@ public:
             ContextType tempContext;
             uint64_t    verifyKey;
 
-            do
+            while (true)
             {
                 seq1 = hotSet->Seqs[hitIndex].load(std::memory_order_acquire);
 
@@ -996,23 +1006,26 @@ public:
                 // Weak-MMU architectures like ARM64.
                 // --------------------------------------------------------------------
                 tempContext = CacheContextTraits<TContextSize>::Read(&coldSet[setIndex].Contexts[hitIndex]);
-                verifyKey = hotSet->Keys[hitIndex].load(std::memory_order_relaxed);
+                verifyKey   = hotSet->Keys[hitIndex].load(std::memory_order_relaxed);
 
                 std::atomic_thread_fence(std::memory_order_acquire);
-
                 seq2 = hotSet->Seqs[hitIndex].load(std::memory_order_relaxed);
 
-            } while (seq1 != seq2 || (seq1 & 1) != 0);
+                if (seq1 == seq2) [[likely]]
+                {
+                    break;
+                }
+            }
 
             if (verifyKey == key) [[likely]]
             {
                 outContext = tempContext;
-
                 return true;
             }
-        }
 
-        return false;
+            // Key moved or was deleted mid-read. Loop around and rescan.
+            YieldProcessorThread(); 
+        }
     }
 
     // ------------------------------------------------------------------------
@@ -1034,21 +1047,26 @@ public:
             return false;
         }
 
-        uint64_t hash = Hasher(key);
+        uint64_t hash       = Hasher(key);
         uint32_t shardIndex = static_cast<uint32_t>((hash >> 48) ^ (hash >> 56)) & (m_shardCount - 1);
-        Shard* shard      = &m_shards[shardIndex];
+        Shard*   shard      = &m_shards[shardIndex];
 
-        size_t setIndex = (hash ^ (hash >> 32)) & shard->Mask;
-        CacheSetHot* hotSet = &shard->HotSets[setIndex];
+        size_t       setIndex = (hash ^ (hash >> 32)) & shard->Mask;
+        CacheSetHot* hotSet   = &shard->HotSets[setIndex];
 
-        int hitIndex = FindHitIndex(hotSet, key);
-        if (hitIndex != -1) [[likely]]
+        while (true)
         {
+            int hitIndex = FindHitIndex(hotSet, key);            
+            if (hitIndex == -1) 
+            {
+                return false;
+            }
+
             uint64_t seq1;
             uint64_t seq2;
             uint64_t verifyKey;
 
-            do
+            while (true)
             {
                 seq1 = hotSet->Seqs[hitIndex].load(std::memory_order_acquire);
                 if ((seq1 & 1) != 0) [[unlikely]]
@@ -1060,18 +1078,22 @@ public:
                 verifyKey = hotSet->Keys[hitIndex].load(std::memory_order_relaxed);
 
                 std::atomic_thread_fence(std::memory_order_acquire);
-
                 seq2 = hotSet->Seqs[hitIndex].load(std::memory_order_relaxed);
 
-            } while (seq1 != seq2 || (seq1 & 1) != 0);
+                if (seq1 == seq2) [[likely]]
+                {
+                    break;
+                }
+            }
 
             if (verifyKey == key) [[likely]]
             {
                 return true;
             }
-        }
 
-        return false;
+            // Key moved or was deleted mid-read. Loop around and rescan.
+            YieldProcessorThread();
+        }
     }
 
     // ------------------------------------------------------------------------
@@ -1097,17 +1119,23 @@ public:
             return false;
         }
 
-        uint64_t hash = Hasher(key);
+        uint64_t hash       = Hasher(key);
         uint32_t shardIndex = static_cast<uint32_t>((hash >> 48) ^ (hash >> 56)) & (m_shardCount - 1);
-        Shard* shard      = &m_shards[shardIndex];
+        Shard*   shard      = &m_shards[shardIndex];
 
-        size_t setIndex = (hash ^ (hash >> 32)) & shard->Mask;
-        CacheSetHot* hotSet  = &shard->HotSets[setIndex];
-        CacheSetCold* coldSet = shard->ColdSets;
+        size_t        setIndex = (hash ^ (hash >> 32)) & shard->Mask;
+        CacheSetHot*  hotSet   = &shard->HotSets[setIndex];
+        CacheSetCold* coldSet  = shard->ColdSets;
 
-        int hitIndex = FindHitIndex(hotSet, key);
-        if (hitIndex != -1) [[likely]]
+        while (true)
         {
+            int hitIndex = FindHitIndex(hotSet, key);
+
+            if (hitIndex == -1)
+            {
+                return false;
+            }
+
             if constexpr (TContextSize > 0)
             {
                 if (outDeletedContext != nullptr)
@@ -1116,14 +1144,16 @@ public:
                 }
             }
 
-            uint64_t seq     = hotSet->Seqs[hitIndex].load(std::memory_order_relaxed);
+            uint64_t seq = hotSet->Seqs[hitIndex].load(std::memory_order_relaxed);
             uint32_t retries = 0;
 
             while (true)
             {
                 if ((seq & 1) == 0) [[likely]]
                 {
-                    if (hotSet->Seqs[hitIndex].compare_exchange_weak(seq, seq + 1, std::memory_order_acquire, std::memory_order_relaxed)) [[likely]]
+                    // Lock for Delete (Update Intent)
+                    uint64_t lockedSeq = seq | 1;
+                    if (hotSet->Seqs[hitIndex].compare_exchange_weak(seq, lockedSeq, std::memory_order_acquire, std::memory_order_relaxed)) [[likely]]
                     {
                         if (hotSet->Keys[hitIndex].load(std::memory_order_relaxed) == key) [[likely]]
                         {
@@ -1141,15 +1171,15 @@ public:
                             hotSet->Keys[hitIndex].store(0, std::memory_order_relaxed);
 
                             // Publish the zeroed key to invalidate concurrent readers
-                            hotSet->Seqs[hitIndex].store(seq + 2, std::memory_order_release);
+                            hotSet->Seqs[hitIndex].store((seq + 4) & ~3ULL, std::memory_order_release);
 
                             return true;
                         }
 
-                        // Key mismatch (it was deleted/overwritten while we spun). Unlock and return false.
-                        hotSet->Seqs[hitIndex].store(seq + 2, std::memory_order_release);
-
-                        return false;
+                        // Key mismatch (it was deleted/overwritten while we spun). 
+                        // Abort lock and allow outer FindHitIndex to re-scan.                        
+                        hotSet->Seqs[hitIndex].store((seq + 4) & ~3ULL, std::memory_order_release);
+                        break;
                     }
                 }
                 else [[unlikely]]
@@ -1158,9 +1188,9 @@ public:
                     seq = hotSet->Seqs[hitIndex].load(std::memory_order_relaxed);
                 }
             }
-        }
 
-        return false;
+            YieldProcessorThread();
+        }
     }
 
     // ------------------------------------------------------------------------
@@ -1177,7 +1207,7 @@ public:
     //              the static callback scope.
     // ------------------------------------------------------------------------
     void Enumerate(EnumerateCallback callback,
-                   void* userData)
+                   void*             userData)
     {
         if (!m_shards || !callback) [[unlikely]]
         {
@@ -1190,7 +1220,7 @@ public:
 
             for (size_t setIdx = 0; setIdx < numSets; ++setIdx)
             {
-                CacheSetHot* hotSet  = &m_shards[i].HotSets[setIdx];
+                CacheSetHot*  hotSet  = &m_shards[i].HotSets[setIdx];
                 CacheSetCold* coldSet = m_shards[i].ColdSets;
 
                 for (int slot = 0; slot < 8; ++slot)
@@ -1200,7 +1230,12 @@ public:
                     ContextType context{};
                     uint64_t    key;
 
-                    do
+                    // --------------------------------------------------------------------
+                    // Safe Infinite Retry Loop
+                    // Replaces the do-while loop to safely allow early restarts (continue) 
+                    // without triggering undefined behavior from evaluating uninitialized data.
+                    // --------------------------------------------------------------------
+                    while (true)
                     {
                         seq1 = hotSet->Seqs[slot].load(std::memory_order_acquire);
                         if ((seq1 & 1) != 0) [[unlikely]]
@@ -1210,7 +1245,7 @@ public:
                         }
 
                         if constexpr (TContextSize > 0)
-                        {
+                        {                         
                             context = CacheContextTraits<TContextSize>::Read(&coldSet[setIdx].Contexts[slot]);
                         }
 
@@ -1220,7 +1255,11 @@ public:
 
                         seq2 = hotSet->Seqs[slot].load(std::memory_order_relaxed);
 
-                    } while (seq1 != seq2 || (seq1 & 1) != 0);
+                        if (seq1 == seq2) [[likely]]
+                        {
+                            break;
+                        }
+                    }
 
                     if (key != 0) [[likely]]
                     {
