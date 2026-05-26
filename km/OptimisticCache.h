@@ -230,8 +230,7 @@ private:
         CacheSetHot*  pSetsHot;        // Pointer to the contiguous block of Hot metadata sets
         CacheSetCold* pSetsCold;       // Pointer to the contiguous block of Cold payload sets
         SIZE_T        uMask;           // Bitwise mask used to rapidly route hashes to specific buckets
-        SIZE_T        uAllocationSize; // Track exactly how much memory was allocated
-        ULONG         uVictimEntropy;  // 4-byte counter for zero-cost entropy
+        SIZE_T        uAllocationSize; // Track exactly how much memory was allocated        
     };
 
     Shard* m_pShards;                  // Aligned array of cache shards used to distribute workload and minimize lock contention
@@ -327,7 +326,7 @@ public:
             ulNumProcs = 4; // Fallback edge case if OS fails to report cores
         }
 
-        ULONG ulTargetShards = ulNumProcs * 4;
+        ULONG ulTargetShards = ulNumProcs * 8;
 
         m_ulShardCount = 1;
         while (m_ulShardCount < ulTargetShards)
@@ -335,9 +334,9 @@ public:
             m_ulShardCount <<= 1;
         }
 
-        if (m_ulShardCount > 512)
+        if (m_ulShardCount > 1024)
         {
-            m_ulShardCount = 512; // Cap shards to prevent extreme memory fragmentation
+            m_ulShardCount = 1024; // Cap shards to prevent extreme memory fragmentation
         }
 
         POOL_EXTENDED_PARAMETER shardExtParams = { 0 };
@@ -438,19 +437,6 @@ public:
             m_pShards[i].uMask           = uSets - 1;
             m_pShards[i].uAllocationSize = cbHot + cbCold + 63;
             
-        #if defined(_M_AMD64) || defined(_M_IX86)
-            ULONG ulEntropySeed = static_cast<ULONG>(__rdtsc());
-        #elif defined(_M_ARM64)
-            ULONG ulEntropySeed = static_cast<ULONG>(_ReadStatusReg(ARM64_CNTVCT_EL0));
-        #else
-            // Fallback for unsupported architectures to ensure it still compiles
-            LARGE_INTEGER tickCount;
-            KeQueryTickCount(&tickCount);
-            ULONG ulEntropySeed = tickCount.LowPart;
-        #endif
-
-            m_pShards[i].uVictimEntropy = ulEntropySeed ^ i;
-
             RtlZeroMemory(m_pShards[i].pSetsHot, cbHot);
 
             if constexpr (TContextSize > 0)
@@ -698,10 +684,13 @@ public:
         UINT64 hash   = Hasher(ullKey);
         Shard* pShard = &m_pShards[static_cast<ULONG>((hash >> 48) ^ (hash >> 56)) & (m_ulShardCount - 1)];
 
-        CacheSetHot*  pHot  = &pShard->pSetsHot[hash & pShard->uMask];
-        CacheSetCold* pCold = pShard->pSetsCold;
+        SIZE_T        uSetIdx = hash & pShard->uMask;
+        CacheSetHot*  pHot    = &pShard->pSetsHot[uSetIdx];
+        CacheSetCold* pCold   = pShard->pSetsCold;
 
-        ULONG ulGlobalulRetries = 0;
+        UINT64 ullThreadPtr = reinterpret_cast<UINT64>(KeGetCurrentThread());
+
+        ULONG ulGlobalRetries = 0;
 
         while (true)
         {
@@ -717,7 +706,7 @@ public:
 
                     if constexpr (TContextSize > 0)
                     {
-                        CACHE_PREFETCH(const_cast<ContextType*>(&pCold[hash & pShard->uMask].Contexts[i]));
+                        CACHE_PREFETCH(const_cast<ContextType*>(&pCold[uSetIdx].Contexts[i]));
                     }
 
                     break;
@@ -730,9 +719,11 @@ public:
             }
 
             if (iTargetIdx == -1)
-            {
-                // Mix the key, the retry count, and the per-shard victim entropy.                
-                iTargetIdx = Hasher(ullKey ^ (pShard->uVictimEntropy++) ^ ulGlobalulRetries) & 7;                
+            {                
+                UINT64 ullThreadSalt = (ullThreadPtr >> 6) * 0x9E3779B97F4A7C15ULL;
+
+                // Mix the key, the retry count and thread salt                 
+                iTargetIdx = Hasher(ullKey ^ ullThreadSalt ^ ulGlobalRetries) & 7;
             }
 
             UINT64 seq = pHot->Seqs[iTargetIdx];
@@ -861,7 +852,7 @@ public:
                 KeLowerIrql(oldIrql);
             }
 
-            ExecuteTieredBackoff(ulGlobalulRetries++);
+            ExecuteTieredBackoff(ulGlobalRetries++);
         }
     }
 
