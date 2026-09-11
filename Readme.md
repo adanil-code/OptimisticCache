@@ -4,12 +4,19 @@
 ![Language: C++17/20](https://img.shields.io/badge/Language-C%2B%2B17%2F20-orange)
 ![Environment: User & Kernel Mode](https://img.shields.io/badge/Environment-User%20%7C%20Kernel%20Mode-success)
 
-Designed as a high-performance alternative to reader-writer lock–based concurrent maps under heavy contention.
+A set-associative, NUMA-aware concurrent cache for C++. By physically segregating L1 search metadata from payloads and utilizing an optimistic SeqLock protocol, it delivers a wait-free fast path for readers and eliminates read-induced MESI bus floods under heavy cross-core scaling
 
-* **Optimistic reads with wait-free fast path** via SeqLock protocol
-* **L1-optimized** metadata layout
-* **NUMA-aware** sharded design
-* **Dual Environment:** User Mode + Windows Kernel Mode support
+* **Zero Runtime Allocations:** Once initialized, the cache performs absolutely no heap or non-paged pool allocations on the hot path. This guarantees deterministic tail latencies and eliminates memory fragmentation.
+
+* **Multi-Platform User-Mode (UM):** A drop-in C++20 header designed for read-heavy, low-latency user-space applications (HFT, packet routing, game engines) with minimal-to-zero external dependencies.
+
+* **Native Windows Kernel (KM) Support:** Fully WDM/KMDF compliant out of the box. Safe to execute at elevated IRQLs (DISPATCH_LEVEL) without page faults or deadlocks.
+
+* **Wait-Free Optimistic Reads:** Reader threads check a version sequence instead of asserting locks, eliminating cache-line bouncing. While readers may retry during active writes, they never suspend on OS-level synchronization primitives.
+
+* **NUMA-Aware Sharding & Tiered Backoff:** Distributes memory blocks across NUMA nodes to mitigate write contention, paired with a tiered backoff strategy for high-contention spikes.
+
+* **Kernel-Grade Verification:** To guarantee memory-ordering safety across both UM and KM environments, the cache algorithm is rigorously torture-tested under heavy multi-core load using an included,  WDM test driver (test_drv/).
 
 > ⚠️ This is NOT a general-purpose concurrent hash map.
 > It is a fixed-size, set-associative cache with eviction under pressure.
@@ -44,6 +51,16 @@ Additionally, colocating large payloads alongside search metadata causes **cache
 
 ## 2. Key Architectural Highlights
 
+**Architecture at a Glance:**
+This is how the cache systematically eliminates standard WDM and user-mode concurrency bottlenecks:
+
+| Concurrency Bottleneck            | OptimisticCache Solution                                                         |
+| :---                              | :---                                                                             |
+| **Reader/Writer Lock Convoys**    | Wait-free SeqLock reads (Zero atomic RMW instructions on the read path)          |
+| **False Sharing / MESI Floods**   | Sharded `alignas(128)` metadata, physically partitioned by NUMA node             |
+| **L1 Cache Pollution**            | Physical Hot/Cold segregation (Search metadata strictly separated from payloads) |
+| **Priority Inversion / Livelock** | Tiered backoff gracefully degrades from hardware pauses to OS yields/sleeps      |
+
 ### Not a Generic Map: Set-Associative Cache Behavior
 **Important:** This behaves as a fixed-size, set-associative hash cache rather than a dynamically resizing map. It utilizes a strictly fixed bucket size (8 slots per set), performs no collision chaining, and does not dynamically resize. Under capacity or localized collision pressure, it acts as a true cache by forcefully evicting and overwriting existing entries to make room for new ones.
 
@@ -53,12 +70,11 @@ Readers execute lookups that are **Lock-free reads with a wait-free fast path wh
 * **No atomic Read-Modify-Write (RMW) operations**
 * **No shared-state writes**
 
-Validation is handled entirely via a monotonic sequence number: `read sequence` → `read data` → `re-read sequence`.
-A read is successful only if the sequence is **even** and **unchanged**. This completely avoids reader tracking, cache line bouncing, and inter-core coherence storms. 
+Validation is handled entirely via a monotonic sequence number: `read sequence` → `read data` → `re-read sequence`. A read is successful only if the sequence is **even** and **unchanged**. This avoids reader tracking, cache line bouncing, and inter-core coherence storms. 
 **The monotonically increasing sequence counter prevents ABA-style inconsistencies within the SeqLock validation model without requiring tagged pointers or hazard tracking.**
 
 ### Memory Layout Geometry
-The cache utilizes a "Mega-Block" flat-array design. Each shard allocates a single, contiguous block of NUMA-pinned memory, physically separating the highly-contended L1 search metadata from the bulky payload data.
+The cache utilizes a "Mega-Block" flat-array design. Each shard allocates a single, contiguous block of NUMA-pinned memory, separating the highly-contended L1 search metadata from the bulky payload data.
 
     ===============================================================================
                           GLOBAL OPTIMISTIC CACHE
@@ -81,6 +97,7 @@ The cache utilizes a "Mega-Block" flat-array design. Each shard allocates a sing
                     | Sequences[8]          |       |                       |
                     +-----------------------+       +-----------------------+
                     | ...                   |       | ...                   |
+
 
 ### Hot / Cold Memory Segregation
 As illustrated in the geometry above, metadata and payloads are physically separated to maximize cache efficiency.
