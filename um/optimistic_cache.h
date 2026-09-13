@@ -1056,42 +1056,57 @@ public:
 
         while (true)
         {
-            int hitIndex = FindHitIndex(hotSet, key);            
-            if (hitIndex == -1) 
+            std::array<uint64_t, 8> snapshotSeqs;
+            uint64_t aggregateSeq = 0;
+
+            // 1. Snapshot and validate bucket state
+            for (int i = 0; i < 8; ++i)
             {
-                return false;
+                snapshotSeqs[i] = hotSet->Seqs[i].load(std::memory_order_acquire);
+                aggregateSeq |= snapshotSeqs[i];
             }
 
-            uint64_t seq1;
-            uint64_t seq2;
-            uint64_t verifyKey;
-
-            while (true)
+            // If any slot is locked (odd), yield and retry
+            if ((aggregateSeq & 1) != 0) [[unlikely]]
             {
-                seq1 = hotSet->Seqs[hitIndex].load(std::memory_order_acquire);
-                if ((seq1 & 1) != 0) [[unlikely]]
+                YieldProcessorThread();
+                continue;
+            }
+
+            // 2. Perform the key scan
+            int hitIndex = FindHitIndex(hotSet, key);
+
+            // 3. Fast-path Hit Validation (Standard single-slot SeqLock)
+            if (hitIndex != -1) 
+            {
+                std::atomic_thread_fence(std::memory_order_acquire);
+                if (snapshotSeqs[hitIndex] == hotSet->Seqs[hitIndex].load(std::memory_order_relaxed)) [[likely]]
                 {
-                    YieldProcessorThread();
-                    continue;
+                    return true;
                 }
 
-                verifyKey = hotSet->Keys[hitIndex].load(std::memory_order_relaxed);
+                YieldProcessorThread();
+                continue;
+            }
 
-                std::atomic_thread_fence(std::memory_order_acquire);
-                seq2 = hotSet->Seqs[hitIndex].load(std::memory_order_relaxed);
-
-                if (seq1 == seq2) [[likely]]
+            // 4. Slow-path Miss Validation
+            std::atomic_thread_fence(std::memory_order_acquire);
+            bool cleanMiss = true;
+        
+            for (int i = 0; i < 8; ++i)
+            {
+                if (snapshotSeqs[i] != hotSet->Seqs[i].load(std::memory_order_relaxed))
                 {
+                    cleanMiss = false;
                     break;
                 }
             }
 
-            if (verifyKey == key) [[likely]]
+            if (cleanMiss) [[likely]]
             {
-                return true;
+                return false;
             }
 
-            // Key moved or was deleted mid-read. Loop around and rescan.
             YieldProcessorThread();
         }
     }
