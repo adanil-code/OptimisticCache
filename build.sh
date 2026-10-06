@@ -39,11 +39,11 @@ if [ "$CLEAN_BUILD" = true ]; then
     rm -rf build
 fi
 
-echo "========================================"
-echo " Building test_optimistic_lock          "
-echo " Build Type:  $BUILD_TYPE               "
-echo " Compiler:    $COMPILER                 "
-echo "========================================"
+echo "==========================================="
+echo " Building test_optimistic_cache            "
+echo " Build Type:  $BUILD_TYPE                  "
+echo " Compiler:    $COMPILER                    "
+echo "==========================================="
 
 mkdir -p build
 cd build
@@ -56,7 +56,7 @@ echo "-> Compiling..."
 # Automatically uses all available cores on Linux or Mac
 cmake --build . -j $(nproc 2>/dev/null || sysctl -n hw.ncpu)
 
-echo "========================================"
-echo " Build successful!                      "
-echo " Run via: ./build/bin/test_optimistic_lock "
-echo "========================================"
+echo "==========================================="
+echo " Build successful!                         "
+echo " Run via: ./build/bin/test_optimistic_cache"
+echo "==========================================="

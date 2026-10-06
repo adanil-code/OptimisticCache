@@ -238,18 +238,38 @@ private:
     ULONG  m_ulShardCount;             // Total number of shards, guaranteed to be a power of two for fast bitwise hash routing
 
     // ------------------------------------------------------------------------
-    // Hasher
-    // Fast avalanche mixer (SplitMix64 variant) for high-entropy key distribution
+    // Hasher (128-bit Multiply-and-Fold / WyHash-style MUM mixer)
+    // High-performance avalanche mixer for high-entropy key distribution.
+    // Computes a 64x64 -> 128-bit product against a vetted prime constant and
+    // XOR-folds the upper and lower 64-bit halves to ensure complete bit 
+    // diffusion.
+    //
+    // Replaces the previous version sequential SplitMix64 double-multiply chain
+    // with native hardware multiplier instructions (_umul128 on x64, __umulh on
+    // ARM64, dropping instruction latency.
     // ------------------------------------------------------------------------
-    static __forceinline UINT64 Hasher(_In_ UINT64 ullData)
+    [[nodiscard]] static inline UINT64 Hasher(UINT64 z) noexcept
     {
-        UINT64 ullMixed = ullData ^ (ullData >> 30);
-        ullMixed *= 0xbf58476d1ce4e5b9ULL;
-        ullMixed ^= (ullMixed >> 27);
-        ullMixed *= 0x94d049bb133111ebULL;
-        ullMixed ^= (ullMixed >> 31);
+        // WyHash constants: vetted prime and Weyl seed
+        constexpr UINT64 kSeed  = 0x2d351824359d3ef1ULL;
+        constexpr UINT64 kPrime = 0x8bb84b93962eacc9ULL;
 
-        return ullMixed;
+        z ^= kSeed;
+
+    #if defined(_MSC_VER) && (defined(_M_X64) || defined(_M_AMD64))
+        // x64: Hardware mul instruction
+        UINT64 high;
+        UINT64 low = _umul128(z, kPrime, &high);
+        return low ^ high;
+
+    #elif defined(_MSC_VER) && (defined(_M_ARM64))
+        // ARM64: Hardware umulh instruction
+        UINT64 high = __umulh(z, kPrime);
+        UINT64 low = z * kPrime;
+        return low ^ high;
+    #else
+        #error "MixHash requires a 64-bit architecture (x64 or ARM64)."
+    #endif
     }
 
     // ------------------------------------------------------------------------

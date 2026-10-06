@@ -26,7 +26,7 @@
     </ClInclude>
   </ItemGroup>
   <ItemGroup>
-    <ClCompile Include="test_optimistic_lock.cpp">
+    <ClCompile Include="test_optimistic_cache.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
   </ItemGroup>

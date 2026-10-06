@@ -189,14 +189,22 @@ inline std::string cpu_name()
 // ----------------------------------------------------------------------------
 inline uint64_t GetTestHardwareTickCount()
 {
-#if defined(_WIN32) || defined(__x86_64__) || defined(__i386__)
+#if defined(_M_X64) || defined(_M_IX86) || defined(_M_AMD64) || defined(__x86_64__) || defined(__i386__)
+    // x86 / x64 on Windows, Linux, and macOS
     return __rdtsc();
-#elif defined(__aarch64__)
+
+#elif defined(_MSC_VER) && (defined(_M_ARM64) || defined(_M_ARM64EC))
+    // ARM64 / ARM64EC on Windows (MSVC): compiles directly to `mrs ..., cntvct_el0`
+    return static_cast<uint64_t>(_ReadStatusReg(ARM64_CNTVCT));
+
+#elif defined(__aarch64__) || defined(__arm64__)
+    // ARM64 on Linux, macOS (Apple Silicon), and Android (GCC / Clang)
     uint64_t val;
-    asm volatile("mrs %0, cntvct_el0" : "=r" (val));
+    asm volatile("mrs %0, cntvct_el0" : "=r"(val));
     return val;
+
 #else
-    return 0; // Fallback for platforms without direct counter access
+    return 0; // Fallback for unsupported architectures
 #endif
 }
 

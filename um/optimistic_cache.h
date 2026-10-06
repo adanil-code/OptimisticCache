@@ -436,20 +436,72 @@ private:
     uint32_t m_shardCount;             // Total number of shards, guaranteed to be a power of two for fast bitwise hash routing
 
     // ------------------------------------------------------------------------
-    // Hasher
-    // Fast avalanche mixer (SplitMix64 variant) for high-entropy key distribution
+    // Hasher (128-bit Multiply-and-Fold / WyHash-style MUM mixer)
+    // High-performance avalanche mixer for high-entropy key distribution.
+    // Computes a 64x64 -> 128-bit product against a vetted prime constant and
+    // XOR-folds the upper and lower 64-bit halves to ensure complete bit 
+    // diffusion.
+    //
+    // Replaces the previous version sequential SplitMix64 double-multiply chain
+    // with native hardware multiplier instructions (_umul128 on x64, __umulh on
+    // ARM64/ARM64EC, and unsigned __int128 on GCC/Clang), dropping instruction 
+    // latency while maintaining a bit-exact software decomposition fallback for
+    // 32-bit x86.
     // ------------------------------------------------------------------------
-    static inline uint64_t Hasher(uint64_t z)
+    [[nodiscard]] static inline uint64_t Hasher(uint64_t z) noexcept
     {
-        uint64_t mixed = z ^ (z >> 30);
-        mixed *= 0xbf58476d1ce4e5b9ULL;
-        mixed ^= (mixed >> 27);
-        mixed *= 0x94d049bb133111ebULL;
-        mixed ^= (mixed >> 31);
+        // WyHash constants: vetted prime and Weyl seed
+        constexpr uint64_t kSeed  = 0x2d351824359d3ef1ULL;
+        constexpr uint64_t kPrime = 0x8bb84b93962eacc9ULL;
 
-        return mixed;
+        z ^= kSeed;
+
+    #if defined(__SIZEOF_INT128__)
+        // 64-bit GCC / Clang (Linux, macOS, BSD): Native 128-bit multiplier
+        unsigned __int128 p = static_cast<unsigned __int128>(z) * kPrime;
+        return static_cast<uint64_t>(p) ^ static_cast<uint64_t>(p >> 64);
+
+    #elif defined(_MSC_VER) && (defined(_M_X64) || defined(_M_AMD64))
+        // 64-bit MSVC (Windows x64): Hardware mul instruction
+        uint64_t high;
+        uint64_t low = _umul128(z, kPrime, &high);
+        return low ^ high;
+
+    #elif defined(_MSC_VER) && (defined(_M_ARM64) || defined(_M_ARM64EC))
+        // 64-bit MSVC (Windows ARM64 / ARM64EC): Hardware umulh instruction
+        uint64_t high = __umulh(z, kPrime);
+        uint64_t low = z * kPrime;
+        return low ^ high;
+
+    #else
+        // 32-bit Fallback (x86, ARM32): Exact 128-bit software decomposition
+        const uint32_t al = static_cast<uint32_t>(z);
+        const uint32_t ah = static_cast<uint32_t>(z >> 32);
+        constexpr uint32_t bl = static_cast<uint32_t>(kPrime);
+        constexpr uint32_t bh = static_cast<uint32_t>(kPrime >> 32);
+
+        #if defined(_MSC_VER)
+            // MSVC 32-bit intrinsic emitting direct hardware 32x32 -> 64-bit `mul`
+            const uint64_t ll = __emulu(al, bl);
+            const uint64_t hl = __emulu(ah, bl);
+            const uint64_t lh = __emulu(al, bh);
+            const uint64_t hh = __emulu(ah, bh);
+        #else
+            // GCC/Clang 32-bit compiles 32-bit operand widening to native `mull`
+            const uint64_t ll = static_cast<uint64_t>(al) * bl;
+            const uint64_t hl = static_cast<uint64_t>(ah) * bl;
+            const uint64_t lh = static_cast<uint64_t>(al) * bh;
+            const uint64_t hh = static_cast<uint64_t>(ah) * bh;
+        #endif
+
+        const uint64_t cross = (ll >> 32) + static_cast<uint32_t>(hl) + static_cast<uint32_t>(lh);
+        const uint64_t upper = (hl >> 32) + (lh >> 32) + (cross >> 32) + hh;
+        const uint64_t lower = (cross << 32) | static_cast<uint32_t>(ll);
+
+        return lower ^ upper;
+    #endif
     }
-
+    
     // ------------------------------------------------------------------------
     // FindHitIndex
     // Performs a relaxed linear scan of a bucket. Ordering is handled by SeqLock.

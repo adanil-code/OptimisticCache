@@ -4,7 +4,7 @@
 ![Language: C++17/20](https://img.shields.io/badge/Language-C%2B%2B17%2F20-orange)
 ![Environment: User & Kernel Mode](https://img.shields.io/badge/Environment-User%20%7C%20Kernel%20Mode-success)
 
-A set-associative, NUMA-aware concurrent cache for C++. By physically segregating L1 search metadata from payloads and utilizing an optimistic SeqLock protocol, it delivers a wait-free fast path for readers and eliminates read-induced MESI bus floods under heavy cross-core scaling
+A set-associative, NUMA-aware concurrent cache for C++. By physically segregating L1 search metadata from payloads and utilizing an optimistic SeqLock protocol, it delivers a wait-free fast path for readers and eliminates read-induced MESI bus floods under heavy cross-core scaling.
 
 * **Zero Runtime Allocations:** Once initialized, the cache performs absolutely no heap or non-paged pool allocations on the hot path. This guarantees deterministic tail latencies and eliminates memory fragmentation.
 
@@ -16,7 +16,7 @@ A set-associative, NUMA-aware concurrent cache for C++. By physically segregatin
 
 * **NUMA-Aware Sharding & Tiered Backoff:** Distributes memory blocks across NUMA nodes to mitigate write contention, paired with a tiered backoff strategy for high-contention spikes.
 
-* **Kernel-Grade Verification:** To guarantee memory-ordering safety across both UM and KM environments, the cache algorithm is rigorously torture-tested under heavy multi-core load using an included,  WDM test driver (test_drv/).
+* **Kernel-Grade Verification:** To guarantee memory-ordering safety across both UM and KM environments, the cache algorithm is rigorously torture-tested under heavy multi-core load using an included WDM test driver (test_drv/).
 
 > ⚠️ This is NOT a general-purpose concurrent hash map.
 > It is a fixed-size, set-associative cache with eviction under pressure.
@@ -91,13 +91,12 @@ The cache utilizes a "Mega-Block" flat-array design. Each shard allocates a sing
                       Hot Array (L1 Search)           Cold Array (Payloads)
                     +-----------------------+       +-----------------------+
       Set 0  -----> | Keys[8] (64B)         | ----> | Contexts[8]           |
-      (Hash % Mask) | Sequences[8] (64B)    |       | (512B or 1024B)       |
+      (Fold & Mask) | Sequences[8] (64B)    |       | (64B or 128B)         |
                     +-----------------------+       +-----------------------+
       Set 1  -----> | Keys[8]               | ----> | Contexts[8]           |
                     | Sequences[8]          |       |                       |
                     +-----------------------+       +-----------------------+
                     | ...                   |       | ...                   |
-
 
 ### Hot / Cold Memory Segregation
 As illustrated in the geometry above, metadata and payloads are physically separated to maximize cache efficiency.
@@ -173,18 +172,24 @@ Because the cache does not dynamically resize and utilizes flat pre-allocated ar
 1. `seq1 = load(sequence, acquire)`
 2. `if odd → retry`
 3. `read payload (relaxed)`
-4. `seq2 = load(sequence, acquire)`
-5. `if mismatch → retry`
+4. `read key (relaxed)`
+5. `acquire fence`
+6. `seq2 = load(sequence, relaxed)`
+7. `if seq1 != seq2 or key mismatch → retry`
 
 **Writer**
-1. `CAS even → odd`
+1. `CAS even → odd` (`seq | 1` for update; `seq | 3` intent bit for insert)
 2. `write payload (relaxed)`
-3. `store odd → even (release)`
+3. `release fence`
+4. `store odd → even (release)`
 
 ### Duplicate Insertion Race Prevention
 To guarantee correctness under concurrent insert races and ensure no duplicate keys exist within a set, the following mitigation is used:
-* After locking a victim slot, the entire 8-slot set is rescanned.
-* If **any** slot currently contains the target key, or if **any** other slot is actively locked (odd sequence), the operation immediately aborts, drops its lock, and retries.
+* After locking a victim slot (transitioning sequence to `seq | 3` to publish insert intent), the entire 8-slot set is rescanned.
+* If another slot is discovered containing the identical target key:
+  * If the matching slot is already committed or undergoing an update, the inserting thread aborts.
+  * If the matching slot is an in-flight concurrent insert (`seq & 3 == 3`), an index tie-breaker determines which thread proceeds and which aborts.
+* Active locks on *unrelated* keys do not trigger an abort, ensuring independent slots in the bucket remain fully concurrent.
 
 ---
 
@@ -195,7 +200,7 @@ To achieve extreme read scalability, the following tradeoffs were made:
 Randomized eviction avoids shared replacement metadata (e.g., LRU counters), preventing additional write contention and cache line traffic.
 * **Read Retries:** Readers may retry under localized write contention (see SeqLock protocol).
 * **Spin-Based Writes:** Writes are optimistic and spin-based, not strictly lock-free.
-* **Torn 128-bit Payloads:** 128-bit payloads may tear during concurrent reads, any torn read is detected via sequence mismatch and retried.
+* **Torn 128-bit Payloads:** 128-bit payloads may tear during concurrent reads; any torn read is detected via sequence mismatch and retried.
 * **Workload Bias:** The architecture is heavily optimized for read-dominant workloads.
 
 ---
@@ -216,10 +221,10 @@ This architecture enforces strict hardware alignment and spin-based synchronizat
 
 While designed for high-concurrency environments, this architecture possesses specific degradation paths under adverse conditions. Understanding these limits—and how the architecture empirically mitigates them—is critical for stable deployment:
 
-* **Eviction Thrashing (Statistical Clustering):** Despite the high-entropy SplitMix64 hasher, the strict 8-way set-associative design lacks collision chaining. In rare cases where a burst of keys maps to the exact same 8-slot bucket, the cache will repeatedly overwrite entries, temporarily degrading the hit rate for those specific keys.
+* **Eviction Thrashing (Statistical Clustering):** Despite the high-entropy 128-bit multiply-and-fold mixer (`Hasher`), the strict 8-way set-associative design lacks collision chaining. In rare cases where a burst of keys maps to the exact same 8-slot bucket, the cache will repeatedly overwrite entries, temporarily degrading the hit rate for those specific keys.
 
 * **Targeted Write Contention (MESI Bus Flooding):** The optimistic SeqLock shifts contention cost to readers, which may starve under heavy writes. If a workload heavily mutates the *exact same key* or bucket simultaneously, the atomic compare-and-swap operations will generate massive cache line invalidation traffic. Writers will spin, and readers will be forced into continuous retry loops, risking temporary starvation. 
-    * *Empirical Note (Global Write Resilience):* While *targeted* writes degrade performance, benchmarks demonstrate that *global* write-heavy workloads (e.g., a 10% Read / 90% Write split uniformly distributed across the key space) do not trigger this collapse. The combination of `SplitMix64` avalanche mixing and high-capacity sharding successfully isolates contention to individual hardware-aligned buckets. This allows the cache to maintain linear scaling and nanosecond tail latencies, outperforming standard global mutexes even well outside its ideal read-heavy domain.
+    * *Empirical Note (Global Write Resilience):* While *targeted* writes degrade performance, benchmarks demonstrate that *global* write-heavy workloads (e.g., a 10% Read / 90% Write split uniformly distributed across the key space) do not trigger this collapse. The combination of hardware-accelerated 128-bit multiply-and-fold avalanche mixing (`Hasher`) and high-capacity sharding successfully isolates contention to individual hardware-aligned buckets. This allows the cache to maintain linear scaling and nanosecond tail latencies, outperforming standard global mutexes even well outside its ideal read-heavy domain.
 
 * **Preemption & Starvation Dynamics (Environment Dependent):** SeqLock relies on spin-based polling, making thread scheduling critical:
     * *User Mode:* If a writer is preempted while holding a slot in the “odd” (write-in-progress) state, forward progress on that slot stalls. All readers will fail validation and enter retry loops, creating a temporary read blackout for that entry. Under contention, this can amplify into elevated CPU usage and increased cache-coherence traffic. To mitigate livelock and excessive spinning, the implementation employs ExecuteTieredBackoff, progressively degrading from hardware pause instructions to scheduler yields and short sleeps.
@@ -227,10 +232,10 @@ While designed for high-concurrency environments, this architecture possesses sp
 
 * **128-bit Payload Tearing Retries:** `OptimisticCache<128>` uses two separate 64-bit relaxed atomic loads. While the overarching SeqLock prevents corrupted data from "torn reads", a high volume of concurrent writes to a 128-bit slot will force readers to loop and retry more frequently than in the 64-bit configuration.
 
-* **No Backpressure or Fairness Mechanism** The architecture intentionally avoids locks, queues, and coordination structures. As a result:
-    * There is no fairness between threads
-    * No prioritization of older operations
-    * No mechanism to throttle or shed load under pressure
+* **No Backpressure or Fairness Mechanism:** The architecture intentionally avoids locks, queues, and coordination structures. As a result:
+    * There is no fairness between threads.
+    * No prioritization of older operations.
+    * No mechanism to throttle or shed load under pressure.
 
     Under overload or hotspot contention, the system does not degrade gracefully—it continues to spin and retry, potentially increasing CPU utilization without making proportional forward progress.
 
@@ -254,57 +259,118 @@ Both implementations share identical geometry and architecture, but adapt to the
 
 ## 10. Benchmarks & Scaling Performance
 
-To validate the architecture, the Optimistic Cache was benchmarked against a standard implementation (`std::unordered_map` protected by `std::shared_mutex`) across three distinct hardware topologies:
-
-* **Intel Core i7-1165G7** (4 Cores / 8 Threads, Low Power Mobile)
-* **Intel Core i7-8086K** (6 Cores / 12 Threads, High Clock Desktop)
-* **Intel Core i7-12700H** (14 Cores / 20 Threads, Big.LITTLE Hybrid)
+To validate the architecture, the Optimistic Cache was benchmarked against a standard baseline implementation (`std::unordered_map` guarded by `std::shared_mutex`) across multiple hardware and OS execution environments.
 
 ### Test Methodology
-* **Key Distribution:** Uniform random via `std::mt19937_64` feeding into the internal `SplitMix64` avalanche mixer.
+* **Key Distribution:** Uniform random via `std::mt19937_64` feeding into the internal 128-bit multiply-and-fold avalanche mixer (WyHash MUM style via `Hasher`).
 * **Load Factor:** ~50% (Table pre-populated with 65,000 items in a 131,072 capacity cache).
-* **Access Patterns:** Tested across 80/20 (Read-Heavy), 50/50 (Mixed Contention), and 95/5 (Highly Skewed) read/write profiles. 
+* **Access Patterns:** Tested across 80/20 (Read-Heavy), 50/50 (Mixed Contention), and 95/5 (Highly Skewed) read/write profiles.
+* **Payload Size:** All representative metrics below are based on the `<64-bit>` payload context configuration.
 
-*Note: All representative metrics below are based on the `<64-bit>` payload context configuration.*
+---
 
-### Multi-Threaded Scaling (The "Lock Convoy" Collapse)
-Under an 80/20 Read-Heavy workload, the Optimistic Cache scales efficiently with physical hardware cores. Conversely, the standard library implementation exhibits negative scaling under high contention; as thread counts increase, global lock contention causes total throughput to plummet below single-threaded baseline speeds.
+### 10.1 Windows Native Performance (Bare Metal — Windows 10 / Windows 11)
+
+Benchmarked natively across three physical hardware architectures:
+* **Intel Core i7-1165G7** (4 Cores / 8 Threads, Low-Power Mobile)
+* **Intel Core i7-8086K** (6 Cores / 12 Threads, High-Clock Desktop)
+* **Intel Core i7-12700H** (14 Cores / 20 Threads, Big.LITTLE Hybrid Architecture)
+
+#### Multi-Threaded Scaling (The "Lock Convoy" Collapse)
+Under an 80/20 Read-Heavy workload, the Optimistic Cache scales efficiently with physical hardware cores. Conversely, the standard library implementation exhibits negative scaling under contention; as thread counts increase, global lock contention causes total throughput to plummet well below single-threaded baseline speeds.
 
 | Implementation       | i7-1165G7 (Mobile, 8-Thread) | i7-8086K (Desktop, 12-Thread) | i7-12700H (Hybrid, 20-Thread) |
 | :------------------- | :--------------------------- | :---------------------------- | :---------------------------- |
-| **Std: Map+Mutex**   | 0.32x (Negative Scaling)     | 0.44x (Negative Scaling)      | 0.28x (Negative Scaling)      |
-| **Lock-Free Cache**  | **3.01x** (at 8 threads)     | **7.15x** (at 12 threads)     | **8.82x** (at 20 threads)     |
+| **Std: Map+Mutex**   | 0.35x (Negative Scaling)     | 0.47x (Negative Scaling)      | 0.29x (Negative Scaling)      |
+| **Lock-Free Cache**  | **3.17x** (at 8 threads)     | **7.21x** (at 12 threads)     | **8.58x** (at 20 threads)     |
 
-### Predictable Tail Latency (P99.9, P99.99)
-At extreme percentiles, the true cost of OS-mediated locks becomes apparent. At the 99.9th percentile (approaches the algorithmic minimum latency of the lookup path), the wait-free SeqLock protocol maintains nanosecond-level latency, avoiding the severe context-switch penalties of standard locking mechanisms. 
+#### Predictable Tail Latency (P99.9, P99.99)
+At extreme percentiles, the true cost of OS-mediated locks becomes apparent. At the 99.9th percentile (approaching the algorithmic minimum latency of the lookup path), the wait-free SeqLock protocol maintains nanosecond-level latency, avoiding context-switch penalties.
 
 **Metric: P99.9 Latency**
 | Hardware Topology       | Std: Map+Mutex | Lock-Free Cache | Stability Advantage    |
 | :---------------------- | :------------- | :-------------- | :--------------------- |
-| **i7-1165G7 (Mobile)**  | 207,514 ns     | **179 ns**      | **1,159x More Stable** |
-| **i7-8086K (Desktop)**  | 236,869 ns     | **107 ns**      | **2,213x More Stable** |
-| **i7-12700H (Hybrid)**  | 591,390 ns     | **231 ns**      | **2,560x More Stable** |
+| **i7-1165G7 (Mobile)**  | 236,074 ns     | **216 ns**      | **1,093x More Stable** |
+| **i7-8086K (Desktop)**  | 270,500 ns     | **108 ns**      | **2,528x More Stable** |
+| **i7-12700H (Hybrid)**  | 526,714 ns     | **256 ns**      | **2,066x More Stable** |
 
 **Metric: P99.99 Latency (OS Wait Starvation)**
-At the 99.99th percentile, standard locks frequently stall for over a millisecond as threads are descheduled. The Optimistic Cache's tiered hardware backoff and wait-free reads significantly reduces tail latency variance.
+At the 99.99th percentile, standard locks frequently stall for over a millisecond as threads are descheduled. The Optimistic Cache's tiered hardware backoff and wait-free reads significantly suppress tail latency spikes.
 
 | Hardware Topology       | Std: Map+Mutex | Lock-Free Cache | Stability Advantage    |
 | :---------------------- | :------------- | :-------------- | :--------------------- |
-| **i7-1165G7 (Mobile)**  | 656,625 ns     | **3,278 ns**    | **200x More Stable**   |
-| **i7-8086K (Desktop)**  | 553,988 ns     | **246 ns**      | **2,251x More Stable** |
-| **i7-12700H (Hybrid)**  | 1,476,190 ns   | **301 ns**      | **4,904x More Stable** |
+| **i7-1165G7 (Mobile)**  | 837,315 ns     | **3,418 ns**    | **245x More Stable**   |
+| **i7-8086K (Desktop)**  | 614,743 ns     | **129 ns**      | **4,803x More Stable** |
+| **i7-12700H (Hybrid)**  | 1,208,686 ns   | **382 ns**      | **3,172x More Stable** |
 
-### Total Throughput Speedup (Mixed Contention)
-Under heavy 50/50 mixed workloads (simultaneous reads, inserts, and aggressive evictions), the architectural differences create a significant performance gap. As core counts scale up, the standard table collapses under its own synchronization weight, while the Optimistic Cache leverages its sharded layout and wait-free reads to achieve high throughput.
+#### Total Throughput Speedup (50/50 Mixed Contention)
+Under heavy 50/50 mixed workloads (simultaneous reads, inserts, and aggressive evictions), the architectural differences create a significant performance gap. As core counts scale up, the standard table collapses under its own synchronization overhead, while the Optimistic Cache leverages its sharded layout and wait-free reads to maintain high throughput.
 
 | System Profile                  | Lock-Free Ops/Sec | Std Ops/Sec       | Total Speedup     |
 | :------------------------------ | :---------------- | :---------------- | :---------------- |
-| **Mobile (4-Core/8-Thread)**    | 92.7 Million      | 6.4 Million       | **~14.5x Faster** |
-| **Desktop (6-Core/12-Thread)**  | 212.0 Million     | 8.1 Million       | **~26.2x Faster** |
-| **Hybrid (14-Core/20-Thread)**  | 261.2 Million     | 5.8 Million       | **~45.0x Faster** |
+| **Mobile (4-Core/8-Thread)**    | 78.1 Million      | 6.0 Million       | **~13.1x Faster** |
+| **Desktop (6-Core/12-Thread)**  | 205.7 Million     | 8.2 Million       | **~25.1x Faster** |
+| **Hybrid (14-Core/20-Thread)**  | 239.0 Million     | 6.2 Million       | **~38.4x Faster** |
+
+---
+
+### 10.2 Linux Virtualized Performance (Ubuntu 26.04.1 on VMware Guest)
+
+Benchmarked on **Ubuntu 26.04.1 LTS** running as a VMware Workstation guest allocated 8 vCPUs, hosted on an Intel Core i7-8086K (Windows 10 host).
+
+In a virtualized guest environment, lock contention is severely magnified: when a vCPU holding a kernel mutex or `pthread` rwlock is descheduled by the host hypervisor, all contending threads stall catastrophically. The Optimistic Cache avoids guest-to-host context-switching penalties by keeping reads completely wait-free.
+
+#### Max Throughput (50/50 Mixed Contention Workload)
+Under a balanced 50/50 read/write workload with concurrent evictions, the Lock-Free cache scales efficiently across all 8 virtual cores, while the standard mutex baseline collapses as soon as multiple vCPUs compete for the lock:
+
+| Metric                            | Lock-Free Cache           | Std: Mutex Map Baseline   | Performance Advantage |
+| :-------------------------------- | :------------------------ | :------------------------ | :-------------------- |
+| **Max Multi-Thread Throughput**   | **171.0 Million Ops/sec** | 1.85 Million Ops/sec      | **~92.5x Faster**     |
+| **Single-Thread Peak Throughput** | 32.8 Million Ops/sec      | 20.5 Million Ops/sec      | **~1.6x Faster**      |
+
+*Even when compared against the mutex baseline's absolute best single-threaded throughput (20.5M Ops/s), the Lock-Free cache delivers an **~8.3x throughput advantage** at full 8-vCPU load.*
+
+#### Tail Latency Comparison (Ubuntu on VMware Guest)
+Hypervisor scheduling jitter amplifies tail latency for locking primitives, pushing the standard mutex baseline to over 8 milliseconds at P99.99. The wait-free SeqLock read path maintains nanosecond latency through P99.9.
+
+| Percentile Metric             | Lock-Free Cache | Std: Mutex Baseline | Stability Advantage    |
+| :---------------------------- | :-------------- | :------------------ | :--------------------- |
+| **P50 (Median)**              | 30 ns           | 22 ns               | 0.73x (Uncontended)    |
+| **P90 (Typical Load)**        | 56 ns           | 142 ns              | **2.54x More Stable**  |
+| **P99 (High Load)**           | 83 ns           | 83,986 ns           | **1,012x More Stable** |
+| **P99.9 (Algorithmic Limit)** | 106 ns          | 353,783 ns          | **3,338x More Stable** |
+| **P99.99 (Wait Starvation)**  | 14,085 ns       | 8,106,945 ns        | **576x More Stable**   |
+
+---
+
+### 10.3 Thread Scaling Sweep (Windows 10 Native vs Ubuntu VMware Guest)
+
+The graphs below illustrate scaling behavior and raw throughput progression under a balanced **50/50 mixed contention workload** (simultaneous reads, inserts, and active evictions with a 64-bit context) on the Intel Core i7-8086K.
+
+#### Windows 10 Native (Bare Metal — 6 Cores / 12 Threads)
+
+<a href="assets/thread_scaling_8086K_win10.png">
+  <img src="assets/thread_scaling_8086K_win10.png" alt="Thread Scaling Sweep — Intel Core i7-8086K (Windows 10 Native)" width="1000">
+</a>
+
+* **Lock-Free Cache:** Scales near-linearly across the 6 physical cores and continues to leverage SMT/hyperthreading, advancing from **31.3M Ops/s** at 1 thread to **205.7M Ops/s (6.57x scaling)** at 12 threads. Hot/cold set isolation and sharding effectively eliminate cross-core cache-line bouncing.
+* **STL Mutex Baseline:** Experiences immediate lock convoying. As thread concurrency increases, throughput degrades monotonically from **16.5M Ops/s** down to **8.2M Ops/s (0.50x scaling)** at 12 threads—halving single-threaded performance due to OS mutex arbitration and cache coherence storms.
+
+---
+
+#### Ubuntu 26.04.1 LTS (VMware Workstation Guest — 8 vCPUs)
+
+<a href="assets/thread_scaling_8086K_ubuntu_vm.png">
+  <img src="assets/thread_scaling_8086K_ubuntu_vm.png" alt="Thread Scaling Sweep — Intel Core i7-8086K (Ubuntu VMware Guest)" width="1000">
+</a>
+
+* **Lock-Free Cache:** Maintains steady, robust scaling inside the virtual machine, climbing from **32.8M Ops/s** at 1 thread to **171.0M Ops/s (5.22x scaling)** across all 8 vCPUs. Because readers and writers avoid blocking primitives, the cache is immune to hypervisor lock-holder preemption delays.
+* **STL Mutex Baseline:** Suffers a catastrophic virtualization collapse. The moment concurrency exceeds a single vCPU, throughput plummets from **20.5M Ops/s** down to **3.4M Ops/s** at 2 threads and bottoms out at **1.8M Ops/s (0.09x scaling)** at 8 threads. When the hypervisor deschedules a vCPU holding a mutex, all other guest threads hard-stall, causing an **~92.5x performance deficit** compared to the lock-free architecture.
+
+---
 
 ### Reproducing Benchmarks
-All benchmarks were conducted on Windows 10/11 using the `test_um` harness included in this repository, compiled with Microsoft Visual Studio 2026. The corresponding MSVC project files are provided for full reproducibility.
+All benchmarks were conducted using the `test_um` harness included in this repository, compiled with Microsoft Visual Studio on Windows and GCC/Clang on Linux. The corresponding project files and build scripts are provided for full reproducibility.
 
 ---
 
@@ -319,10 +385,10 @@ The repository is organized into distinct layers to separate the core cache logi
     * `optimistic_cache.h`: The cross-platform C++20 header for Linux, macOS, and Windows applications.
 
 * **`test_km/`**: Test code for verifying kernel-mode logic within a user-mode environment.
-    * `TestOptimisticCacheKm/cpp`: Driver logic test harnesses utilizing simulated IRQL conditions.
+    * `TestOptimisticCacheKm.cpp`: Driver logic test harnesses utilizing simulated IRQL conditions.
 
 * **`test_um/`**: Cross-platform user-mode performance test suite.
-    * `test_optimistic_lock.cpp`: The primary validation and benchmarking suite.
+    * `test_optimistic_cache.cpp`: The primary validation and benchmarking suite.
 
 * **`test_common/`**: Shared test logic used by both kernel and user-mode performance tests.
    * `std_cache.h`: A wrapper for standard library comparisons.
@@ -368,7 +434,7 @@ Options:
 ```
 
 ```bash
-#Set permissions (once):
+# Set permissions (once):
 chmod +x ./build.sh
 
 # Standard Release build using default C++ compiler
@@ -396,15 +462,15 @@ If you prefer building without CMake, ensure you include the -pthread and -lnuma
 ```bash
 # GCC (Linux)
 g++ -std=c++20 -O3 -march=native -flto=auto -funroll-loops -fomit-frame-pointer -fno-rtti -fexceptions -pthread \
-    -I./um -I./test_um -I./test_common test_um/test_optimistic_lock.cpp -o bin/test_optimistic_lock -lnuma
+    -I./um -I./test_um -I./test_common test_um/test_optimistic_cache.cpp -o bin/test_optimistic_cache -lnuma
 	
 # Clang (Linux/macOS - omit -lnuma on Mac)
 clang++ -std=c++20 -O3 -march=native -flto -funroll-loops -fomit-frame-pointer -fno-rtti -fexceptions -pthread \
-    -I./um -I./test_um -I./test_common test_um/test_optimistic_lock.cpp -o bin/test_optimistic_lock -lnuma
+    -I./um -I./test_um -I./test_common test_um/test_optimistic_cache.cpp -o bin/test_optimistic_cache -lnuma
 ```
 
-**Recommended Step:** Running the Benchmark on Linux
-To ensure the test suite can accurately benchmark tail latencies, apply NUMA node affinity, and manage thread priorities without requiring full root privileges, it is highly recommended to grant the `test_optimistic_lock` executable the CAP_SYS_NICE capability before execution.
+**Recommended Step:** Running the Benchmark on Linux  
+To ensure the test suite can accurately benchmark tail latencies, apply NUMA node affinity, and manage thread priorities without requiring full root privileges, grant the `test_optimistic_cache` executable the `CAP_SYS_NICE` capability:
 
 ```bash
 # Ubuntu / Debian
@@ -413,14 +479,13 @@ sudo apt install libcap2-bin
 # RHEL / Fedora / CentOS
 sudo dnf install libcap          
 
-sudo setcap cap_sys_nice+ep ./build/bin/test_optimistic_lock
+sudo setcap cap_sys_nice+ep ./build/bin/test_optimistic_cache
 ```
 
 ### Windows (User-Mode & Kernel-Mode)
 Native Visual Studio Solution (.slnx/.sln) and Project (.vcxproj) files are included in the repository.
 
-**User-Mode** Build using Visual Studio 2022 or later.
-* *Note:* If building with Visual Studio 2022, you must manually change the Platform Toolset to `v143` in the project properties.
+**User-Mode:** Build using Visual Studio 2022 or later.
 * Requires C++20.
 * NUMA support is handled natively via VirtualAllocExNuma.
 
@@ -438,7 +503,7 @@ Based on this architecture's mechanical sympathy—specifically its Hot/Cold mem
 
 * **Massive L3 Caches (AMD 3D V-Cache / Server CPUs):** The L1-optimized Hot Sets pack 8 slots of search metadata into exactly 128 bytes (two adjacent cache lines). With the proliferation of massive L3 SRAM on modern server chips, entire metadata shards can remain permanently resident in cache. Failed lookups or hash collision scans will complete at L1/L3 speeds without ever touching main memory or fetching bulky payloads.
 
-* **High-Density NUMA & Many-Core (EPYC / Xeon / Graviton):** Because optimistic readers never execute atomic RMW (Read-Modify-Write) instructions, they generate **zero** cross-die cache coherency traffic. On high-core-count NUMA systems where inter-core communication latency is the primary bottleneck, this allows read-heavy workloads to scale near-perfectly as physical cores are added.
+* **High-Density NUMA & Many-Core (EPYC / Xeon / Graviton):** Because optimistic readers never execute atomic RMW (Read-Modify-Write) instructions, they generate **zero** cross-die cache coherency traffic. On high-core-count NUMA systems where inter-core communication latency is the primary bottleneck, this allows read-heavy workloads to scale well as physical cores are added.
 
 * **ARM64 & Weak Memory Models (Apple Silicon / Cloud Native ARM):** The architecture relies on precise C++20 `std::memory_order_acquire`/`release` fences rather than implicit x86 Total Store Order (TSO) guarantees. This ensures that the wait-free fast path will scale efficiently and safely on high-core ARM server processors without risking torn reads or pipeline stalls. 
 

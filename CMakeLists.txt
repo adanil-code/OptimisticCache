@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.25)
 
-project(test_optimistic_lock_project LANGUAGES CXX)
+project(test_optimistic_cache_project LANGUAGES CXX)
 
 # ------------------------------------------------------------
 # Compiler Verification
@@ -26,17 +26,17 @@ endif()
 find_package(Threads REQUIRED)
 
 # ============================================================
-# TARGET: test_optimistic_lock
+# TARGET: test_optimistic_cache
 # ============================================================
 
 # Explicitly defining source files via variable for consistency
 set(TEST_UM_SOURCES
-    test_um/test_optimistic_lock.cpp
+    test_um/test_optimistic_cache.cpp
 )
 
-add_executable(test_optimistic_lock ${TEST_UM_SOURCES})
+add_executable(test_optimistic_cache ${TEST_UM_SOURCES})
 
-target_include_directories(test_optimistic_lock PRIVATE
+target_include_directories(test_optimistic_cache PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/um
     ${CMAKE_CURRENT_SOURCE_DIR}/test_um
     ${CMAKE_CURRENT_SOURCE_DIR}/test_common 
@@ -44,24 +44,24 @@ target_include_directories(test_optimistic_lock PRIVATE
 
 # Compiler optimization flags (mirroring your original performance focus)
 if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
-    target_compile_options(test_optimistic_lock PRIVATE
+    target_compile_options(test_optimistic_cache PRIVATE
         -O3 -march=native -flto=auto -funroll-loops
         -fomit-frame-pointer -fno-rtti -fexceptions -pthread
     )
 elseif(CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
-    target_compile_options(test_optimistic_lock PRIVATE
+    target_compile_options(test_optimistic_cache PRIVATE
         -O3 -march=native -flto -funroll-loops
         -fomit-frame-pointer -fno-rtti -fexceptions -pthread 
     )
 endif()
 
-target_link_options(test_optimistic_lock PRIVATE -flto)
-target_link_libraries(test_optimistic_lock PRIVATE Threads::Threads)
+target_link_options(test_optimistic_cache PRIVATE -flto)
+target_link_libraries(test_optimistic_cache PRIVATE Threads::Threads)
 
 # Platform-specific dependencies (Linux only)
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     find_library(NUMA_LIBRARY numa REQUIRED)
-    target_link_libraries(test_optimistic_lock PRIVATE ${NUMA_LIBRARY})
+    target_link_libraries(test_optimistic_cache PRIVATE ${NUMA_LIBRARY})
 endif()
 
-set_target_properties(test_optimistic_lock PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+set_target_properties(test_optimistic_cache PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
